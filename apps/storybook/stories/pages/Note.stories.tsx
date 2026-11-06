@@ -12,9 +12,11 @@ export default meta;
 /** The busy afternoon, with a note in every state a note can be in (src/world/states.ts). */
 const everyState = { beforeEach: changing(inEveryState) };
 
-/** The team standup, written out in full: decisions, a question, follow-ups, a shared screen and your own notes. */
+/** The team standup, written out in full: decisions, a question, follow-ups, a shared screen (its replay above the player, and its frames beside the lines they belong to) and your own notes. */
 export const Standup = page('/notes/n2', 'busy');
 export const StandupPhone = phone(Standup);
+/** Opened while Kofi's screen is up (9:20): the replay shows his share, and the lines said then carry their frames. */
+export const WhileAScreenIsShared = page('/notes/n2?at=560', 'busy');
 /** Art's call this morning: everything in it still waits on Art. */
 export const WaitingOnYou = page('/notes/n1', 'busy');
 /** Someone else's call you were invited to. */

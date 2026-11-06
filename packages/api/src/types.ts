@@ -102,6 +102,15 @@ export type Group = z.infer<typeof GroupSchema>;
 /** The most notes someone can pin. */
 export const MAX_PINS = 8;
 
+/** A model's ID as NEAR AI's catalog names it, e.g. "zai-org/GLM-4.5V". */
+export const ModelIdSchema = z.string().min(1).max(200);
+/**
+ * A verified private model that can read images, which the organizer can choose to read shared screens for the notes.
+ * Found at runtime in NEAR AI's catalog; only models whose attestation can be verified are offered.
+ */
+export const VisionModelSchema = z.object({ id: ModelIdSchema, name: z.string() });
+export type VisionModel = z.infer<typeof VisionModelSchema>;
+
 export const PreferencesSchema = z.object({
   /** Whether new calls start with notes on. Each call can still be set when it's scheduled. */
   notesDefault: NotesSettingSchema,
@@ -116,9 +125,13 @@ export const PreferencesSchema = z.object({
   notifications: NotificationPrefsSchema,
   /** Pinned note IDs, in the order they were pinned. */
   pinned: z.array(IDSchema).max(MAX_PINS).refine(allUnique, 'Pins must be unique'),
-  groups: z.array(GroupSchema).max(MAX_GROUPS).refine((g) => allUnique(g.map((x) => x.id)), 'Group IDs must be unique')
+  groups: z.array(GroupSchema).max(MAX_GROUPS).refine((g) => allUnique(g.map((x) => x.id)), 'Group IDs must be unique'),
+  /** The vision model that reads shared screens for the notes of calls you organize, by its ID in `models.vision()`. Null means the notes model. */
+  screenModel: ModelIdSchema.nullable().default(null)
 });
 export type Preferences = z.infer<typeof PreferencesSchema>;
+/** A change to some preferences. Fields left out keep their value: unlike `PreferencesSchema.partial()`, a missing `screenModel` stays missing rather than taking its default. */
+export const PreferencesPatchSchema = PreferencesSchema.extend({ screenModel: ModelIdSchema.nullable() }).partial();
 
 /* ---------- people ---------- */
 
@@ -146,13 +159,13 @@ export type MeetingStatus = z.infer<typeof MeetingStatusSchema>;
 
 /**
  * What a call's notes keep, set when it's scheduled. Without the transcript, it's used to write the notes and then
- * deleted. Without the recording, the audio is deleted when the call ends. `readScreens` has shared screens go into
- * the notes from the moment notes start, instead of when the organizer turns that on.
+ * deleted. Without the recording, the audio is deleted when the call ends. `readScreens` lets shared screens go in the
+ * notes: each presenter is asked whether theirs does. Without it nobody is asked, and no share is kept.
  */
 export const NotesChoicesSchema = z.object({ keepTranscript: z.boolean(), keepRecording: z.boolean(), readScreens: z.boolean() });
 export type NotesChoices = z.infer<typeof NotesChoicesSchema>;
 /** What a call keeps unless it's set otherwise: every call before these choices existed kept all of it. */
-export const DEFAULT_NOTES_CHOICES: NotesChoices = { keepTranscript: true, keepRecording: true, readScreens: false };
+export const DEFAULT_NOTES_CHOICES: NotesChoices = { keepTranscript: true, keepRecording: true, readScreens: true };
 
 /** Whether a time zone's name is one the runtime knows, such as "Europe/London". */
 export function isTimeZone(name: string): boolean {
@@ -442,10 +455,18 @@ export const ScreenLegibleSchema = z.enum(['clear', 'partly', 'unreadable', 'unr
 export type ScreenLegible = z.infer<typeof ScreenLegibleSchema>;
 
 /**
- * What was on a shared screen at a moment of the call: one frame the presenter's own browser kept because the screen
- * changed. `at` to `until` is the stretch of the recording it was on screen, the part of the transcript it belongs
- * to. The reading (title, text, how legible, the parts worth pointing at) is the private notes model's; its
- * `description` ties the frame to what was said. The image is at notes.screenUrl(noteId, id).
+ * How much a frame of a shared screen matters to what was said. key: the talk points at it, or relies on what it shows.
+ * supporting: it adds to what was said. unrelated: nothing said is about it, so the notes leave it out.
+ */
+export const ScreenRelevanceSchema = z.enum(['key', 'supporting', 'unrelated']);
+export type ScreenRelevance = z.infer<typeof ScreenRelevanceSchema>;
+
+/**
+ * What was on a shared screen at a moment of the call: one frame taken from a share kept for the notes, at a moment
+ * picked from what was said (or to fill a stretch nothing pointed at). `at` to `until` is the stretch of the recording
+ * it stands for, the part of the transcript it belongs to. The reading (title, text, how legible, the parts worth
+ * pointing at, how relevant) is the vision model's; its `description` ties the frame to what was said. The image is at
+ * notes.screenUrl(noteId, id).
  */
 export const ScreenMomentSchema = z.object({
   id: IDSchema,
@@ -467,9 +488,41 @@ export const ScreenMomentSchema = z.object({
   text: z.string(),
   /** What it shows and how it ties in with what was said, once the notes are written. Empty before. */
   description: z.string(),
-  regions: z.array(ScreenRegionSchema)
+  regions: z.array(ScreenRegionSchema),
+  /** How much it matters to what was said. Notes written before frames were judged take `supporting`. */
+  relevance: ScreenRelevanceSchema.default('supporting'),
+  /** What was said that pointed at it ("as you can see…"). Empty when it was taken to fill a stretch, or before cues were kept. */
+  cue: z.string().default(''),
+  /**
+   * The transcript line (`TranscriptLine.id`) it's attached to: at most one moment per line. Null on notes written
+   * before frames were attached to lines, which place it by time.
+   */
+  line: IDSchema.nullable().default(null)
 });
 export type ScreenMoment = z.infer<typeof ScreenMomentSchema>;
+
+/**
+ * A share's video in one segment of the recording: from `at` to `until`, in seconds into the recording as transcript
+ * lines count them. The video's own time 0 is at `at`.
+ */
+export const ScreenShareSegmentSchema = z.object({ segment: z.number(), at: z.number(), until: z.number() });
+export type ScreenShareSegment = z.infer<typeof ScreenShareSegmentSchema>;
+
+/**
+ * A share kept for the notes, which replay shows in step with the audio: whose it was, a label to tell it apart, when
+ * it ran (seconds into the recording) and its video by segment, each at notes.screenVideoUrl(noteId, id, segment).
+ */
+export const ScreenShareSchema = z.object({
+  id: IDSchema,
+  /** Whose screen it was. Absent when the call can't tell any more. */
+  presenter: SpeakerSchema.optional(),
+  /** What to call it beside other shares, e.g. "Priya’s screen" or "Priya’s screen (2)". */
+  label: z.string(),
+  at: z.number(),
+  until: z.number(),
+  segments: z.array(ScreenShareSegmentSchema)
+});
+export type ScreenShare = z.infer<typeof ScreenShareSchema>;
 
 /**
  * Where something in the notes was on a shared screen: the moment (`ScreenMoment.id`), the part of it when one
@@ -768,8 +821,12 @@ export const NoteSchema = NoteSummarySchema.extend({
   chapters: z.array(ChapterSchema),
   /** The stretches of the call with nothing captured, oldest first. Room recordings have none. */
   gaps: z.array(CaptureGapSchema),
-  /** What was on shared screens while screen notes were on, oldest first, each with the stretch of the transcript it belongs to. */
+  /** What was on shared screens kept for the notes, oldest first, each with the stretch of the transcript it belongs to. */
   screens: z.array(ScreenMomentSchema),
+  /** The shares kept for the notes, oldest first, with their video for replay. Empty for notes without any, which play audio alone. */
+  shares: z.array(ScreenShareSchema).default([]),
+  /** The vision model that read the shared screens (an ID from `models.vision()`), or null for the notes model. */
+  screenModel: ModelIdSchema.nullable().default(null),
   /**
    * What was said while notes were on. Null while the recording is still going. Without `kept.transcript` it's empty
    * once the notes are written, and until then for everyone but the organizer.

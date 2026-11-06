@@ -48,7 +48,7 @@ export type Profile = z.infer<typeof Profile>;
 const DEFAULT_PREFERENCES: Preferences = {
   notesDefault: 'on', notesLanguage: 'call', summaryLength: 'short', addToCalendar: true, showOtherMeetings: true, recordOffline: true,
   notifications: { beforeCall: 5, notesReady: true, sharedWithYou: true, notesRequested: true, followUpDue: false },
-  pinned: [], groups: []
+  pinned: [], groups: [], screenModel: null
 };
 
 async function profileItem(o: Owner, db: Db) {
@@ -305,6 +305,7 @@ export async function updatePreferences(o: Owner, patch: Patch<Preferences>): Pr
     recordOffline: patch.recordOffline ?? p.preferences.recordOffline,
     notifications: patch.notifications ?? p.preferences.notifications,
     pinned: patch.pinned ?? p.preferences.pinned,
-    groups: patch.groups ?? p.preferences.groups
+    groups: patch.groups ?? p.preferences.groups,
+    screenModel: patch.screenModel === undefined ? p.preferences.screenModel : patch.screenModel
   } }))).preferences;
 }

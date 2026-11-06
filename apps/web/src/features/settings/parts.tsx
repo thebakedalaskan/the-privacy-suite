@@ -14,7 +14,8 @@ import { useEffect, useRef, useState } from 'react';
 import { uploads } from '~/features/record/uploads';
 import { askToNotify, useNotifyPermission, type NotifyPermission } from '~/features/shell/notify';
 import { useLive } from '~/lib/live';
-import { calendarConnectUrl, q, useDisconnectCalendar } from '~/lib/queries';
+import { calendarConnectUrl, q, useDisconnectCalendar, useVisionModels } from '~/lib/queries';
+import { screenModelOf, screenModelOptions, screenModelValue } from '~/lib/screenModels';
 import { hoursAndMinutes, timeZone } from '~/lib/time';
 import { plural, sizeLabel } from '~/lib/words';
 import { Setting, SwitchSetting, useSave, useSaved } from './save';
@@ -59,6 +60,7 @@ const LANGUAGES: SelectOption<NotesLanguage>[] = [
 
 export function NotesPart({ prefs }: { prefs: Preferences }) {
   const save = useSave();
+  const models = useVisionModels();
   return (
     <SettingsPart id="notes" title="Notes">
       <Setting wide label="Notes for new calls" help="You can still choose for each call when you schedule it."
@@ -70,6 +72,9 @@ export function NotesPart({ prefs }: { prefs: Preferences }) {
       <Setting wide label="Summary" saying="Saved for new notes"
         control={<Segmented<SummaryLength> label="Summary length" value={prefs.summaryLength} onChange={(v) => save('Summary', { summaryLength: v })}
           options={[{ value: 'short', label: 'Short' }, { value: 'detailed', label: 'Detailed' }]} />} />
+      <Setting wide label="Shared screens" help="The model that reads screens shared into the notes of calls you organize. You can change it during a call."
+        control={<Select<string> label="Model that reads shared screens" value={screenModelValue(prefs.screenModel)} options={screenModelOptions(models.data ?? [], prefs.screenModel)}
+          align="end" onChange={(v) => save('Shared screens', { screenModel: screenModelOf(v) })} />} />
     </SettingsPart>
   );
 }

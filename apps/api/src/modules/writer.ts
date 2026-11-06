@@ -13,10 +13,10 @@
  * for each job and wiped after it. The organizer can have the notes written again from a corrected
  * transcript (notes.rewrite): the same job, which keeps what people already settled.
  */
-import type { Change, Decision, InferenceEvidence, Person, RoomNote, ScreenMoment } from '@alcove/api';
+import type { Change, Decision, InferenceEvidence, Person, RoomNote, ScreenMoment, ScreenShare } from '@alcove/api';
 import { z } from 'zod';
 import type { Deps, Owner } from '../context';
-import { id128, openJson, stateKey } from '../crypto';
+import { id128, openJson, sealJson, stateKey, toJson, type RecordHeader } from '../crypto';
 import { bytea, exec, maybeOne, tx } from '../db';
 import { NotFoundError, UnansweredError, UnverifiedError } from '../errors';
 import { inference } from '../inference';
@@ -26,7 +26,7 @@ import { getItem, lockItem, pruneRevisions } from '../vault';
 import { me, profile } from './account';
 import { purgeAudio, queueDelete, segments } from './audio';
 import * as billing from './billing';
-import { briefOf, draft, revisited, roomBriefOf, type NotesStyle, type Settled, type Written } from './drafting';
+import { attachments, briefOf, draft, revisited, roomBriefOf, type NotesStyle, type Settled, type Written } from './drafting';
 import { doneInNotes } from './liveNotes';
 import { NoteManifest, decisionsOf, roomChapters, updateNote, type Revisit } from './notes';
 import { personOf } from './portraits';
@@ -38,6 +38,8 @@ const wlog = log.child({ component: 'writer' });
 const ATTEMPTS = 3;
 /** Longer than the slowest draft (four minutes) and checking the model first; a worker that dies mid-job frees it after this. */
 const LEASE_SECONDS = 300;
+/** How often a running job renews its lease, whatever step it's on (joining video, taking frames, waiting on a model). */
+const HEARTBEAT_MS = (LEASE_SECONDS / 3) * 1000;
 /** How long to wait before trying a job again, after its first and second failures. */
 const RETRY_SECONDS = [20, 90];
 /** How long a job waits before trying the notes model again, when its evidence didn't check out or it didn't answer. */
@@ -45,7 +47,11 @@ const VERIFY_AGAIN_SECONDS = 300;
 
 const Claimed = z.object({ owner_id: z.string(), job_id: z.string(), revision_id: z.string(), job_ciphertext: bytea, attempt: z.number(), tried: z.number() });
 type Claimed = z.infer<typeof Claimed>;
-const Job = z.object({ noteId: z.string(), recordingId: z.string() });
+/** A notes job, sealed: the note and its recording, and how far it has got with the shared screens (none until it starts on them). */
+const Job = z.object({ noteId: z.string(), recordingId: z.string(), screens: screens.ScreenProgressSchema.nullable().default(null) });
+type Job = z.infer<typeof Job>;
+const jobKey = (o: Owner, noteId: string) => stateKey(o.root, o.ownerId, `job:${noteId}`);
+const jobHeader = (o: Owner, noteId: string): RecordHeader => ({ v: 1, kind: 'job', ownerId: o.ownerId, noteId });
 
 /** The next job that's due, leased to this worker. `tried` is how many attempts came before this one. */
 async function claim(d: Deps, ownerId: string | null): Promise<Claimed | undefined> {
@@ -64,8 +70,11 @@ type Item = { text: string; at?: number | undefined; changes: Change[] };
 type RoomWritten = { id: string; notes: Written } | { id: string; failed: true };
 /** Breakout rooms' notes as written, and the verifications the requests went to. */
 interface RoomsWritten { rooms: RoomWritten[]; evidence: InferenceEvidence[] }
-/** What a job wrote: the call's notes (none when nothing was said in the main room), each breakout room's, and when the transcript was read. */
-interface Wrote { notes?: Written | undefined; rooms: RoomsWritten; readAt: string }
+/**
+ * What a job wrote: the call's notes (none when nothing was said in the main room), each breakout room's, when the
+ * transcript was read, and the verifications the shared screens' requests went to (picking moments, reading frames).
+ */
+interface Wrote { notes?: Written | undefined; rooms: RoomsWritten; readAt: string; screens?: InferenceEvidence[] | undefined }
 
 /**
  * The same item in other words. People reword what they confirm, and the notes model words things afresh each time, so
@@ -150,6 +159,18 @@ async function inTurns<T, R>(xs: readonly T[], cap: number, fn: (x: T) => Promis
 }
 
 /**
+ * The note as saved, with any of its screens before (`was`) that something it still lists points at: an item people
+ * settled, kept from notes written before, keeps the moment it was about.
+ */
+function keepPointedAt(was: NoteManifest, next: NoteManifest): NoteManifest {
+  const has = new Set(next.screens.map((m) => m.id));
+  const items = [next, ...next.rooms].flatMap((x) => [...x.decisions, ...x.questions, ...x.actions, ...x.chapters]);
+  const pointed = new Set(items.flatMap((x) => (x.screen ? [x.screen.id] : [])));
+  const back = was.screens.filter((m) => pointed.has(m.id) && !has.has(m.id));
+  return back.length ? { ...next, screens: [...next.screens, ...back].sort((a, b) => a.at - b.at || a.id.localeCompare(b.id)) } : next;
+}
+
+/**
  * Writes the notes into the note, each breakout room's too (or finishes it without them, with its shared screens read
  * when they were), charges for them and closes the job, together. The charge is for the minutes recorded, not the
  * length of the call: time with notes off is free. Whenever they're written, what people already added, confirmed or
@@ -165,14 +186,18 @@ async function inTurns<T, R>(xs: readonly T[], cap: number, fn: (x: T) => Promis
  * copy one. Notes that can't be written leave their part's transcript in the new revision alone, so the organizer can
  * have them written, and it goes when they are. A call set not to keep its recording lost its audio when it ended;
  * anything that got in since goes here too.
+ *
+ * Frames the shared screens' analysis took (`left`) are deleted in the same transaction unless the saved note shows
+ * them (the ones the notes attached, or that something it still lists points at); their objects once it commits. The
+ * rest only went into what the notes say.
  */
-async function settle(o: Owner, jobId: string, noteId: string, wrote: Wrote | undefined, shown?: ScreenMoment[] | undefined): Promise<void> {
+async function settle(o: Owner, jobId: string, noteId: string, wrote: Wrote | undefined, shown?: ScreenMoment[] | undefined, left: string[] = []): Promise<void> {
   const any = Boolean(wrote?.notes) || Boolean(wrote?.rooms.evidence.length);
   const leftover = await tx(o.pool, async (c) => {
     let first = true;
     // Breakout rooms join the chapters the notes wrote, in order: the call's note covers the rooms too.
     // The notes model's verifications join the ones the transcript went to.
-    const next = await updateNote(o, c, noteId, (m) => {
+    const write = (m: NoteManifest): NoteManifest => {
       first = m.writtenAt === null;
       const rooms = roomChapters(m.breakouts);
       const chapters = [...(wrote?.notes?.chapters ?? m.chapters), ...rooms]
@@ -192,7 +217,7 @@ async function settle(o: Owner, jobId: string, noteId: string, wrote: Wrote | un
       const roomsWritten = new Set(wrote.rooms.rooms.flatMap((x) => ('notes' in x ? [x.id] : [])));
       // What's ticked in a room whose notes weren't written waits for them; the call's, for the call's.
       const waiting = m.ticked.filter((t) => (t.room === null ? !wrote.notes : !roomsWritten.has(t.room)));
-      const evidence = [...(wrote.notes ? [wrote.notes.evidence] : []), ...wrote.rooms.evidence];
+      const evidence = [...(wrote.notes ? [wrote.notes.evidence] : []), ...wrote.rooms.evidence, ...(wrote.screens ?? [])];
       const inference = evidence.reduce((all, e) => (all.some((x) => verificationKey(x) === verificationKey(e)) ? all : [...all, e]), m.inference);
       if (!wrote.notes) {
         return { ...m, status: 'ready', chapters, rooms: sections, inference, ticked: waiting, ...(any ? { writtenAt: wrote.readAt } : {}), ...(shown ? { screens: shown } : {}) };
@@ -201,7 +226,8 @@ async function settle(o: Owner, jobId: string, noteId: string, wrote: Wrote | un
       const items = { ...written, ...keepSettled(m, written) };
       const actions = doneInNotes(items.actions, m.ticked.filter((t) => t.room === null), ticks, m.transcript ?? []);
       return { ...m, status: 'ready', ...items, actions, chapters, rooms: sections, writtenAt: wrote.readAt, transcript: m.keep.transcript ? m.transcript : [], inference, ticked: waiting };
-    });
+    };
+    const next = await updateNote(o, c, noteId, (m) => keepPointedAt(m, write(m)));
     await exec(c, 'DELETE FROM content_jobs WHERE owner_id = $1 AND job_id = $2', [o.ownerId, jobId]);
     if (any && first) {
       const recorded = next.recorded ?? (await segments(o, next.recordingId, c)).reduce((n, s) => n + s.seconds, 0);
@@ -213,7 +239,8 @@ async function settle(o: Owner, jobId: string, noteId: string, wrote: Wrote | un
       await exec(c, 'DELETE FROM operations WHERE owner_id = $1', [o.ownerId]);
       wlog.info('transcript deleted, as the call was set to', { noteId, revisions });
     }
-    return next.keep.recording ? [] : purgeAudio(o, c, next.recordingId);
+    const audio = next.keep.recording ? [] : await purgeAudio(o, c, next.recordingId);
+    return [...audio, ...await screens.dropUnused(o, c, noteId, left, new Set(next.screens.map((m) => m.id)))];
   });
   await queueDelete(o, leftover);
 }
@@ -278,7 +305,8 @@ async function attempt(d: Deps, job: Claimed): Promise<void> {
     const rev = await maybeOne(o.pool, z.object({ item_id: z.string() }), 'SELECT item_id FROM revisions WHERE owner_id = $1 AND revision_id = $2', [o.ownerId, job.revision_id]);
     if (!rev) { await drop('note deleted'); return; }
     const noteId = rev.item_id;
-    const { recordingId } = openJson(stateKey(o.root, o.ownerId, `job:${noteId}`), { v: 1, kind: 'job', ownerId: o.ownerId, noteId }, job.job_ciphertext, Job);
+    const stored = openJson(jobKey(o, noteId), jobHeader(o, noteId), job.job_ciphertext, Job);
+    const { recordingId } = stored;
     // Read holding the note, with when: corrections are stamped holding it too, so one made after this is later than
     // `readAt`, and the app offers writing the notes again with it.
     const { note, readAt } = await tx(o.pool, async (c) => {
@@ -287,41 +315,94 @@ async function attempt(d: Deps, job: Claimed): Promise<void> {
     });
     const lines = note.manifest.transcript?.length ?? 0;
     const at = { ...ctx, noteId, recordingId, lines, seconds: note.manifest.duration };
-    // Finishing without notes still keeps what was read on each shared screen so far (kept in its frame's row).
-    const readSoFar = async () => screens.withReadings(note.manifest.screens, note.manifest.screens.length ? await screens.framesOf(o, o.pool, noteId) : []);
-    if (job.tried >= ATTEMPTS) {
-      wlog.error('notes job outlived its last attempt; finishing the note without a summary', at);
-      await settle(o, job.job_id, noteId, undefined, await readSoFar());
+    // A presenter's last piece can still come in for a little while after the call (screens.SHARE_TAIL_MS): the job
+    // waits for it, without using an attempt.
+    const tail = await screens.tailEndsAt(o, recordingId, note.manifest.duration);
+    if (tail !== null && tail > Date.now()) {
+      const waitMs = tail - Date.now();
+      wlog.info('notes waiting for the last of a shared screen', { ...at, retryInMs: waitMs });
+      await exec(d.pool, `UPDATE content_jobs SET state = 'queued', attempt = $3, lease_until = now() + make_interval(secs => $4) WHERE owner_id = $1 AND job_id = $2`,
+        [job.owner_id, job.job_id, job.tried, waitMs / 1000]);
+      setTimeout(() => kick(d, job.owner_id), waitMs + 250).unref();
       return;
     }
+    // What the shared screens' analysis came to, once it has: finishing without notes then keeps it.
+    let analysed: { shown: ScreenMoment[]; grids: Map<string, Uint8Array>; shares: ScreenShare[]; left: string[] } | null = null;
+    // Finishing without notes still keeps what was read on each shared screen so far (kept in its frame's row): with
+    // the notes model's choice of what to attach missing, each share's start and each screen that changed since.
+    const readSoFar = async () => (analysed
+      ? attachments(analysed.shown, note.manifest.transcript ?? [], { grids: analysed.grids, shares: analysed.shares, asked: null })
+      : screens.withReadings(note.manifest.screens, note.manifest.screens.length ? await screens.framesOf(o, o.pool, noteId) : []));
+    // Only while it's being written: a renewal that lands after the job was put back to wait doesn't hold it longer.
+    const renew = async () => {
+      await exec(d.pool, `UPDATE content_jobs SET lease_until = now() + make_interval(secs => $3) WHERE owner_id = $1 AND job_id = $2 AND state = 'writing'`, [job.owner_id, job.job_id, LEASE_SECONDS]);
+    };
+    // The lease is renewed all through the attempt, not only between requests: joining video and taking frames take a
+    // while too. A renewal that fails is logged; the next one tries again.
+    const heartbeat = setInterval(() => { renew().catch((e: unknown) => wlog.warn('notes job lease not renewed', { ...at, err: e })); }, HEARTBEAT_MS);
+    heartbeat.unref();
     try {
       const t0 = performance.now();
-      // What was on shared screens is read first, frame by frame, so the notes can say what was shown while it was said;
-      // a call where nothing was transcribed still keeps what its screens showed.
-      const shown = screens.withReadings(note.manifest.screens, note.manifest.screens.length ? await screens.readAll(o, noteId, recordingId) : []);
+      // Kept shares' video, joined into what replay seeks in (safe to run again on a retried job).
+      // First, before anything that can hold or end the job (the attempts, the notes model): replay doesn't wait for notes.
+      // On the last pass, a join that fails (the object store down) doesn't stop the note being finished.
+      try {
+        await screens.finishVideo(o, recordingId);
+      } catch (e) {
+        if (job.tried < ATTEMPTS) throw e;
+        wlog.warn('shared screens not joined into video before finishing the note', { ...at, err: e });
+      }
+      if (job.tried >= ATTEMPTS) {
+        wlog.error('notes job outlived its last attempt; finishing the note without a summary', at);
+        await settle(o, job.job_id, noteId, undefined, await readSoFar());
+        return;
+      }
+      const shares = await screens.shareIntervals(o, recordingId);
+      // What was on shared screens comes first, so the notes can say what was shown while it was said. With shares
+      // kept on video: frames picked from what was said, read with the model chosen and judged (screens.analyze), each
+      // step kept in the job as it's done. With nothing said there's nothing to tie a screen to, so none are read.
+      // Notes written before video was kept read the frames the presenter's browser sent.
+      let shown: ScreenMoment[] = [];
+      let grids = new Map<string, Uint8Array>();
+      let left: string[] = [];
+      let screenEvidence: InferenceEvidence[] = [];
+      if (shares.length && lines) {
+        const save = async (progress: screens.ScreenProgress) => {
+          const next: Job = { ...stored, screens: progress };
+          await exec(d.pool, 'UPDATE content_jobs SET job_ciphertext = $3 WHERE owner_id = $1 AND job_id = $2', [job.owner_id, job.job_id, sealJson(jobKey(o, noteId), jobHeader(o, noteId), toJson(next))]);
+        };
+        const done = await screens.analyze(o, noteId, recordingId, {
+          lines: note.manifest.transcript ?? [], shares, chosen: note.manifest.screenModel, progress: stored.screens ?? { picks: null, skip: [] }, save, renew
+        });
+        analysed = { shown: done.shown, grids: done.grids, shares, left: done.left };
+        ({ shown, grids, left } = done);
+        screenEvidence = done.evidence;
+      } else if (!shares.length && note.manifest.screens.length) {
+        const frames = await screens.readAll(o, noteId, recordingId);
+        shown = screens.withReadings(note.manifest.screens, frames);
+        // Written now, the notes attach some of these too: the rest go once the notes are saved.
+        left = frames.map((f) => f.id);
+      }
       // The job's owner is the organizer of a call, or the person who recorded a room: their choices decide, for the
       // call's notes and each breakout room's.
       const organizer = await me(o);
       const { notesLanguage: language, summaryLength: length } = (await profile(o)).preferences;
       // After an attempt that didn't work, which may have been cut off, ask for less rather than the same again.
       const style: NotesStyle = { language, length, brief: job.tried > 0 };
-      const renew = async () => {
-        await exec(d.pool, 'UPDATE content_jobs SET lease_until = now() + make_interval(secs => $3) WHERE owner_id = $1 AND job_id = $2', [job.owner_id, job.job_id, LEASE_SECONDS]);
-      };
       // Each breakout room's notes, from what was said there alone.
       const rooms = await writeRooms(o, note.manifest, organizer, style, renew, at);
       if (!lines) {
-        await settle(o, job.job_id, noteId, { rooms, readAt }, shown);
+        await settle(o, job.job_id, noteId, { rooms, readAt, screens: screenEvidence }, shown, analysed?.left);
         wlog.info(rooms.evidence.length ? 'only breakout rooms were transcribed; their notes written' : 'nothing was transcribed; note finished without notes',
           { ...at, screens: shown.length, rooms: note.manifest.rooms.length, roomsWritten: rooms.evidence.length });
         await compareWithEarlier(o, noteId, note.manifest, organizer, at);
         return;
       }
       await renew();
-      const notes = await draft(o.cfg, { ...briefOf(note.manifest, organizer, note.manifest.invited.map((e) => personOf(e))), screens: shown, ticks: note.manifest.ticked.filter((t) => t.room === null) }, style);
-      await settle(o, job.job_id, noteId, { notes, rooms, readAt });
+      const notes = await draft(o.cfg, { ...briefOf(note.manifest, organizer, note.manifest.invited.map((e) => personOf(e))), screens: shown, grids, shares, ticks: note.manifest.ticked.filter((t) => t.room === null) }, style);
+      await settle(o, job.job_id, noteId, { notes, rooms, readAt, screens: screenEvidence }, undefined, left);
       wlog.info('notes written', {
-        ...at, language: style.language, length: style.length, decisions: notes.decisions.length, actions: notes.actions.length, chapters: notes.chapters.length, screens: shown.length,
+        ...at, language: style.language, length: style.length, decisions: notes.decisions.length, actions: notes.actions.length, chapters: notes.chapters.length, screens: shown.length, attached: notes.screens.length,
         screenRefs: [...notes.decisions, ...notes.questions, ...notes.actions, ...notes.chapters].filter((x) => x.screen).length,
         rooms: note.manifest.rooms.length, roomsWritten: rooms.evidence.length, ms: Math.round(performance.now() - t0)
       });
@@ -339,13 +420,15 @@ async function attempt(d: Deps, job: Claimed): Promise<void> {
       }
       if (job.attempt >= ATTEMPTS) {
         wlog.error('notes could not be written after three attempts; finishing the note without a summary', { ...at, err: e });
-        await settle(o, job.job_id, noteId, undefined, await readSoFar());
+        await settle(o, job.job_id, noteId, undefined, await readSoFar(), analysed?.left);
         return;
       }
       const wait = RETRY_SECONDS[job.attempt - 1] ?? 90;
       wlog.warn('notes not written yet; trying again', { ...at, retryInS: wait, err: e });
       await exec(d.pool, `UPDATE content_jobs SET state = 'queued', lease_until = now() + make_interval(secs => $3) WHERE owner_id = $1 AND job_id = $2`, [job.owner_id, job.job_id, wait]);
       setTimeout(() => kick(d, job.owner_id), wait * 1000 + 250).unref();
+    } finally {
+      clearInterval(heartbeat);
     }
   } finally {
     o.root.fill(0);
@@ -377,7 +460,17 @@ export function kick(from: Deps, ownerId: string): void {
   busy.set(ownerId, false);
   void (async () => {
     try {
-      do { busy.set(ownerId, false); await work(d, { ownerId }); } while (busy.get(ownerId));
+      do {
+        busy.set(ownerId, false);
+        // Replay doesn't wait for notes, or for the notes service to be configured: video is joined whenever a share's tail is over.
+        try {
+          const { waitMs } = await screens.joinDue(d, ownerId);
+          if (waitMs !== null) setTimeout(() => kick(d, ownerId), waitMs + 250).unref();
+        } catch (e) {
+          wlog.error('shared screens could not be joined', { err: e });
+        }
+        await work(d, { ownerId });
+      } while (busy.get(ownerId));
     } catch (e) {
       wlog.error('notes worker failed', { err: e });
     } finally {

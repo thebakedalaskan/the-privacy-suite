@@ -8,7 +8,7 @@ import type { DocAskBody, DocAskPart, DocSession, DocSessionOptions, DocVersion,
 import type { DocumentRole, DocumentShare, ItemInput, ItemPlace, ShareTarget, WorkspaceItem, WorkspaceLive, WorkspacePerson, WorkspaceReadOptions, WorkspaceRole, WorkspaceSummary, WorkspaceTree } from './workspaces';
 import type {
   AnswerPart, Attestation, Busy, Calendar, ChangeScope, CreditBalance, DocumentLibrary, ID, ISODate, InstantCallInput, Meeting, MeetingInput, Note, NoteFound, NoteKind, NotesSetting, Inbox,
-  PersonSuggestion, Preferences, Rsvp, Series, SeriesAnswerPart, Session, SignInResult, Team
+  PersonSuggestion, Preferences, Rsvp, Series, SeriesAnswerPart, Session, SignInResult, Team, VisionModel
 } from './types';
 
 /** A partial update: any field may be missing or explicitly undefined. */
@@ -166,6 +166,11 @@ export interface AlcoveApi {
     /** URL of one shared-screen frame of a note (a `ScreenMoment`'s image), for a signed-in browser that has the note. */
     screenUrl(id: ID, frameId: ID): string;
     /**
+     * URL that streams one segment of a kept share's video (a `ScreenShare`'s, in `segment`) to a signed-in browser that
+     * has the note, with ranges, so replay can seek.
+     */
+    screenVideoUrl(id: ID, share: ID, segment: number): string;
+    /**
      * Adds a decision the notes didn't hear, proposed by you, in your exact words. Anyone who has the notes can. Sending
      * the same words again adds nothing.
      */
@@ -193,9 +198,10 @@ export interface AlcoveApi {
     correctLine(noteId: ID, lineId: ID, patch: LinePatch): Promise<Note>;
     /**
      * Writes the notes again from the transcript as it is now, corrections included. The organizer's alone. The
-     * decisions, open questions and follow-ups someone has already confirmed or changed stay as they are.
+     * decisions, open questions and follow-ups someone has already confirmed or changed stay as they are. With
+     * `screenModel` (an ID from `models.vision()`, or null for the notes model), shared screens are read again with it.
      */
-    rewrite(noteId: ID): Promise<Note>;
+    rewrite(noteId: ID, o?: { screenModel?: string | null | undefined }): Promise<Note>;
     /** Answers a question about one written note from its transcript, or from the notes once that's deleted, citing moments in it and the shared screens it read. */
     ask(noteId: ID, question: string): AsyncIterable<AnswerPart>;
     /**
@@ -366,6 +372,10 @@ export interface AlcoveApi {
   };
   credits: {
     balance(): Promise<CreditBalance>;
+  };
+  models: {
+    /** The verified private models that can read shared screens, from NEAR AI's catalog. Empty when it lists none: the notes model reads them. */
+    vision(): Promise<VisionModel[]>;
   };
   trust: {
     /** What the API is running on, attested inside a TEE, for a nonce of 32 random bytes in hex. */

@@ -39,7 +39,8 @@ export const qk = {
   balance: ['credits'] as const,
   trust: ['trust'] as const,
   workspacePeople: (id: string) => ['workspaces', id, 'people'] as const,
-  documentShare: (id: string, documentId: string) => ['workspaces', id, 'share', documentId] as const
+  documentShare: (id: string, documentId: string) => ['workspaces', id, 'share', documentId] as const,
+  visionModels: ['models', 'vision'] as const
 };
 
 /** What the API says it runs on, and whether its answer is bound to the nonce this browser sent. */
@@ -198,10 +199,15 @@ export function useDeleteAccount(onDeleted: () => void) {
 const PREFS_WRITE = { mutationKey: ['prefs', 'write'], scope: { id: 'prefs' } };
 /** `p`, with the fields `take` names copied from `from` (where `from` has them). */
 function withFields(p: Preferences, from: Patch<Preferences>, take: (k: keyof Preferences) => boolean): Preferences {
-  const f = <K extends keyof Preferences>(k: K): Preferences[K] => (take(k) ? from[k] ?? p[k] : p[k]);
+  // A field set to null (screenModel back to the notes model) is a change too: only undefined means not given.
+  const f = <K extends keyof Preferences>(k: K): Preferences[K] => {
+    const v = from[k];
+    return take(k) && v !== undefined ? v : p[k];
+  };
   return {
     notesDefault: f('notesDefault'), notesLanguage: f('notesLanguage'), summaryLength: f('summaryLength'), addToCalendar: f('addToCalendar'),
-    showOtherMeetings: f('showOtherMeetings'), recordOffline: f('recordOffline'), notifications: f('notifications'), pinned: f('pinned'), groups: f('groups')
+    showOtherMeetings: f('showOtherMeetings'), recordOffline: f('recordOffline'), notifications: f('notifications'), pinned: f('pinned'), groups: f('groups'),
+    screenModel: f('screenModel')
   };
 }
 const prefsWrite = (qc: QueryClient) => {
@@ -454,7 +460,17 @@ export function useTakeBack(noteId: string) {
 /** The organizer has the notes written again from the transcript as it is now; the note answers pending until they are. */
 export function useRewriteNotes() {
   const qc = useQueryClient();
-  return useMutation({ mutationFn: (noteId: string) => api.notes.rewrite(noteId), onSuccess: (n) => changed(qc, n) });
+  return useMutation({
+    mutationFn: (v: { noteId: string; screenModel?: string | null | undefined }) => api.notes.rewrite(v.noteId, { screenModel: v.screenModel }),
+    onSuccess: (n) => changed(qc, n)
+  });
+}
+/**
+ * The verified private models that can read shared screens, to choose from for a call's notes or as your default. Empty
+ * when there are none: the notes model reads them then. They change rarely.
+ */
+export function useVisionModels(enabled = true) {
+  return useQuery({ queryKey: qk.visionModels, queryFn: () => api.models.vision(), staleTime: 10 * 60_000, enabled });
 }
 /**
  * Shares a note with people, by address, and with one of your groups, under its name (everyone it reaches sees that

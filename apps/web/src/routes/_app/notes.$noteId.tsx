@@ -2,7 +2,7 @@ import {
   NoteMomentSchema, NoteRoomParamSchema, errorCode, errorMessage, firstName, minutesLabel, type ActionItem, type ActionPatch, type Chapter, type Decision, type DecisionPatch, type Note, type NoteProgress, type Person,
   type PersonalPoint, type Question, type QuestionPatch, type TranscriptLine
 } from '@alcove/api';
-import { Button, Dots, Evening, Faces, Icon, Notice, RecDot, cn, useToast } from '@alcove/ui';
+import { Button, Dots, Evening, Faces, Icon, Notice, RecDot, Select, cn, useToast } from '@alcove/ui';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { createFileRoute, type ErrorComponentProps } from '@tanstack/react-router';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
@@ -10,7 +10,7 @@ import { CallLine, marksOf } from '~/features/notes/CallLine';
 import { Provenance } from '~/features/notes/Evidence';
 import { GonePage, NoteMenu, PageHead } from '~/features/notes/Head';
 import { Propose, useNoteReader, type Seed } from '~/features/notes/entries';
-import { usePlayer, type PlayerState } from '~/features/notes/Player';
+import { Replay, usePlayer, type PlayerState } from '~/features/notes/Player';
 import type { Answer } from '~/features/notes/answer';
 import { askExample, exampleNote } from '~/features/notes/example';
 import { correctedSince, speakersOf, type Correcting } from '~/features/notes/lines';
@@ -27,8 +27,9 @@ import { useNoteOnScreen } from '~/features/shell/notify';
 import { api } from '~/lib/api';
 import { log } from '~/lib/log';
 import { sameEmail } from '~/lib/people';
-import { q, qk, useCorrectLine, useDeleteNote, useProposeAction, useProposeDecision, useRewriteNotes, useUpdateAction, useUpdateDecision, useUpdateQuestion } from '~/lib/queries';
+import { q, qk, useCorrectLine, useDeleteNote, useProposeAction, useProposeDecision, useRewriteNotes, useUpdateAction, useUpdateDecision, useUpdateQuestion, useVisionModels } from '~/lib/queries';
 import { noteAt } from '~/lib/time';
+import { screenModelOf, screenModelOptions, screenModelValue } from '~/lib/screenModels';
 
 export const Route = createFileRoute('/_app/notes/$noteId')({
   /**
@@ -175,6 +176,9 @@ function NoteView({ note, me, at, room, onGone }: { note: Note; me: string | und
   const [sharedTo, setSharedTo] = useState<ReadonlySet<string>>(new Set());
   /* The transcript line someone is proposing something from, if they are. */
   const [seed, setSeed] = useState<Seed | null>(null);
+  // Writing the notes again, when the call had shared screens: which model reads them, and whether that's being chosen.
+  const [screenModel, setScreenModel] = useState<string | null>(note.screenModel);
+  const [choosing, setChoosing] = useState(false);
   const received = note.received;
   const mine = !received;
   const reader = useNoteReader()(received?.role ?? 'organizer');
@@ -204,11 +208,13 @@ function NoteView({ note, me, at, room, onGone }: { note: Note; me: string | und
   };
 
   // What was on shared screens: among the transcript lines, wherever the notes point at it, and in the viewer.
+  // Frames judged to have nothing to do with what was said stay out of sight; they're still deleted with the note.
   const viewer = useScreenViewer();
-  const screens: ScreensShown | undefined = note.screens.length
-    ? { moments: note.screens, row: (m) => <ScreenMomentRow noteId={note.id} m={m} me={me} written={ready} onOpen={viewer.show} /> } : undefined;
-  const onScreen: ScreenRefShown = (ref) => <ScreenRefChip screen={ref} screens={note.screens} onOpen={viewer.show} />;
-  const firstScreen = note.screens[0];
+  const moments = note.screens.filter((m) => m.relevance !== 'unrelated');
+  const screens: ScreensShown | undefined = moments.length
+    ? { moments, row: (m) => <ScreenMomentRow noteId={note.id} m={m} me={me} written={ready} onOpen={viewer.show} /> } : undefined;
+  const onScreen: ScreenRefShown = (ref) => <ScreenRefChip screen={ref} screens={moments} onOpen={viewer.show} />;
+  const firstScreen = moments[0];
 
   const roomsSaid = note.rooms.some((r) => r.transcript.length > 0);
   const roomNotes = note.rooms.some((r) => r.summary.trim() !== '');
@@ -247,12 +253,25 @@ function NoteView({ note, me, at, room, onGone }: { note: Note; me: string | und
   const corrected = correctedSince([...lines, ...note.rooms.flatMap((r) => r.transcript)], note.writtenAt);
   // Where writing them again has got to, once the notes service says.
   const step = note.writingAgain && progress && !progress.ready ? progress.steps.at(-1)?.label : undefined;
-  const writeAgain = () => rewrite.mutate(note.id, { onError: failed });
+  const shared = note.shares.length > 0;
+  const writeAgain = () => rewrite.mutate(shared ? { noteId: note.id, screenModel } : { noteId: note.id }, { onSuccess: () => setChoosing(false), onError: failed });
+  const pickModel = mine && shared ? <ScreenModelPick value={screenModel} onChange={setScreenModel} /> : null;
   // Offered to the organizer once a line, the call's or a breakout room's, was corrected since the notes were written.
   const again = mine && corrected > 0 && !note.writingAgain ? (
     <div className="nd-offer">
       <Icon name="history" size={16} />
       <span>{corrected === 1 ? 'A line was corrected' : `${corrected} lines were corrected`} since these notes were written.</span>
+      {pickModel}
+      <Button size="sm" loading={rewrite.isPending} onClick={writeAgain}>Write the notes again</Button>
+    </div>
+  ) : null;
+  // Asked for from the menu: write them again with another model reading the shared screens.
+  const chooser = mine && shared && choosing && !note.writingAgain ? (
+    <div className="nd-offer" role="group" aria-label="Write the notes again">
+      <Icon name="monitor" size={16} />
+      <span>Writes the notes again from the transcript, with the shared screens read by the model you choose.</span>
+      {pickModel}
+      <Button variant="quiet" size="sm" onClick={() => setChoosing(false)}>Cancel</Button>
       <Button size="sm" loading={rewrite.isPending} onClick={writeAgain}>Write the notes again</Button>
     </div>
   ) : null;
@@ -260,7 +279,7 @@ function NoteView({ note, me, at, room, onGone }: { note: Note; me: string | und
   // Each breakout room's own section, under the call's notes; whether any room has what was said in it to show, and
   // whether any has notes, which stay when a call isn't set to keep what they were written from.
   const settle = ready ? { reader, onDecision: changeDecision, onQuestion: changeQuestion, onToggle: toggle, onAction: changeAction, people: note.recipients.map((r) => r.person), decisionForm, actionForm } : undefined;
-  const tryAgain = mine ? <Button size="sm" className="nd-retry" loading={rewrite.isPending} onClick={writeAgain}>Try writing them again</Button> : null;
+  const tryAgain = mine ? <>{pickModel}<Button size="sm" className="nd-retry" loading={rewrite.isPending} onClick={writeAgain}>Try writing them again</Button></> : null;
   const rooms = note.rooms.length > 0 ? <RoomSections rooms={note.rooms} me={me} writing={!ready || note.writingAgain} correct={correct} fromLine={ready ? proposing : undefined} settle={settle} tryAgain={tryAgain} marks={yours.lines} open={room} at={at} /> : null;
   /** Keeps an answer in your own notes, with what it comes from: nothing else keeps one. */
   const keep = (a: Answer) => yours.own.add.mutateAsync({
@@ -288,7 +307,7 @@ function NoteView({ note, me, at, room, onGone }: { note: Note; me: string | und
     ? `Removes ${asList(['the summary', ...(lines.length ? ['the transcript'] : []), ...(note.rooms.length ? [note.rooms.length === 1 ? 'the breakout room’s section' : `${note.rooms.length} breakout rooms’ sections`] : []), ...(hasAudio ? [`${minutesLabel(note.duration)} of audio`] : []), ...(note.screens.length ? [`${note.screens.length} shared ${note.screens.length === 1 ? 'screen' : 'screens'}`] : []), 'anyone’s own notes on them'])}. Nobody can get them back.`
     : `${organizer ? firstName(organizer.name) : 'The organizer'} and everyone else who has them keep them. Your own notes on them go for good. Anything you added to the shared notes stays there, and you can’t take it back after this.`;
   const transcript = (top?: ReactNode) => <Transcript lines={lines} gaps={note.gaps} seconds={span} me={me} onSeek={seek} focus={focus} player={player} live={live} screens={screens} onScreens={viewer.show} correct={correct} fromLine={fromLine} marks={yours.lines} kinds={kinds} top={top} />;
-  const noScreens = !lines.length && firstScreen && <button type="button" className="nd-act nd-scrlink" onClick={() => viewer.show(firstScreen)}><Icon name="monitor" size={15} />{note.screens.length} shared {note.screens.length === 1 ? 'screen' : 'screens'}</button>;
+  const noScreens = !lines.length && firstScreen && <button type="button" className="nd-act nd-scrlink" onClick={() => viewer.show(firstScreen)}><Icon name="monitor" size={15} />{moments.length} shared {moments.length === 1 ? 'screen' : 'screens'}</button>;
   const view = live ? 'recording' : note.status === 'pending' ? 'writing' : ready && !written && !lines.length ? 'quiet' : 'ready';
   // The call is still writing to these notes, so they stay until it ends.
   const inCall = note.kind === 'call' && note.status === 'recording';
@@ -299,7 +318,7 @@ function NoteView({ note, me, at, room, onGone }: { note: Note; me: string | und
         <>
           <PinNote noteId={note.id} />
           <ShareNote note={note} onShared={(emails) => setSharedTo(new Set(emails))} />
-          <NoteMenu ready={ready} mine={mine} inCall={inCall} ask={delAsk} busy={del.isPending} gone={going} onDelete={() => void remove()}
+          <NoteMenu ready={ready} mine={mine} inCall={inCall} ask={delAsk} onWriteAgain={mine && shared && ready && !note.writingAgain ? () => setChoosing(true) : undefined} busy={del.isPending} gone={going} onDelete={() => void remove()}
             onCopy={() => void navigator.clipboard?.writeText(noteAsText(note)).then(() => toast('Copied as text'))} />
         </>
       )}>
@@ -315,7 +334,9 @@ function NoteView({ note, me, at, room, onGone }: { note: Note; me: string | und
       </CallLine>
       <div className="nd-cols" style={{ '--d': 2 }}>
         <div className="nd-main">
+          {player.total > 0 && note.shares.length > 0 && <div className="mb-4"><Replay noteId={note.id} shares={note.shares} player={player} /></div>}
           <div className="nd-read">
+            {chooser}
             {ready && written ? (
               <>
                 {writingAgain}
@@ -371,7 +392,7 @@ function NoteView({ note, me, at, room, onGone }: { note: Note; me: string | und
           {!going && <SeriesCard note={note} />}
         </aside>
       </div>
-      <ScreenViewer noteId={note.id} screens={note.screens} open={viewer.open} me={me} onOpen={viewer.show} onClose={viewer.close} onSeek={seek} marks={yours.screens} />
+      <ScreenViewer noteId={note.id} screens={moments} open={viewer.open} me={me} onOpen={viewer.show} onClose={viewer.close} onSeek={seek} marks={yours.screens} />
     </Evening>
   );
 }
@@ -388,6 +409,12 @@ function Steps({ steps }: { steps: NoteProgress['steps'] }) {
       ))}
     </ol>
   );
+}
+
+/** Which model reads the shared screens when the notes are written again: the notes model, or a verified vision model. */
+function ScreenModelPick({ value, onChange }: { value: string | null; onChange: (id: string | null) => void }) {
+  const models = useVisionModels();
+  return <Select<string> label="Model that reads the shared screens" icon="monitor" value={screenModelValue(value)} options={screenModelOptions(models.data ?? [], value)} onChange={(v) => onChange(screenModelOf(v))} className="max-w-full" />;
 }
 
 /* Delete is physical: say exactly what went. */

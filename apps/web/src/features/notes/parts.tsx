@@ -132,13 +132,17 @@ export function Transcript({ lines, gaps, seconds, me, onSeek, focus, player, li
   const shown = all ? lines : lines.slice(0, FIRST_LINES);
   const last = shown.at(-1)?.at ?? 0;
   const upTo = <T extends { at: number }>(xs: T[]) => (all ? xs : xs.filter((x) => x.at <= last));
-  const hidden = (screens?.moments ?? []).filter((m) => !all && m.at > last);
+  // A screen attached to a line waits with that line; one whose line isn't in the transcript waits by time.
+  const ids = new Set(lines.map((l) => l.id));
+  const showing = new Set(shown.map((l) => l.id));
+  const waiting = (m: ScreenMoment) => (m.line !== null && ids.has(m.line) ? showing.has(m.line) : m.at <= last);
+  const hidden = (screens?.moments ?? []).filter((m) => !all && !waiting(m));
   const [nextHidden] = hidden;
   return (
     <section className="nd-s nd-tr">
       <div className="nd-sh"><h2>Transcript</h2><UnsureKey words={lines.some((l) => l.unsure?.words)} speaker={lines.some((l) => l.unsure?.speaker)} className="nd-key" /></div>
       {top}
-      <TranscriptLines lines={shown} gaps={upTo(gaps)} me={me} onSeek={onSeek} focus={focus?.at} lit={lit} screens={screens && { ...screens, moments: upTo(screens.moments) }} correct={correct} fromLine={fromLine} marks={marks} kinds={kinds} />
+      <TranscriptLines lines={shown} gaps={upTo(gaps)} me={me} onSeek={onSeek} focus={focus?.at} lit={lit} screens={screens && { ...screens, moments: all ? screens.moments : screens.moments.filter(waiting) }} correct={correct} fromLine={fromLine} marks={marks} kinds={kinds} />
       {(lines.length > FIRST_LINES || nextHidden) && (
         <div className="nd-allrow">
           {lines.length > FIRST_LINES && (
@@ -185,8 +189,9 @@ export interface ScreensShown { moments: ScreenMoment[]; row: (m: ScreenMoment) 
 
 /**
  * What was said, line by line, with the stretches nothing was captured in marked where they fall, and what was on a
- * shared screen just before the lines said while it was up. A speaker's lines in a row share one name; a room recording
- * names nobody. With `focus`, the line said at that moment is where a moment's link lands, and `lit` is the line to mark.
+ * shared screen right after the line it's attached to (or, for one attached to no line shown, just before the lines
+ * said while it was up). A speaker's lines in a row share one name; a room recording names nobody. With `focus`, the line
+ * said at that moment is where a moment's link lands, and `lit` is the line to mark.
  * With `correct`, whoever may corrects lines in place (lines.tsx). With `marks`, they bookmark lines for themselves.
  */
 export function TranscriptLines({ lines, gaps = [], me, onSeek, focus, lit, screens, correct, fromLine, marks, kinds, className }: {
@@ -198,17 +203,24 @@ export function TranscriptLines({ lines, gaps = [], me, onSeek, focus, lit, scre
   const gap = (g: CaptureGap) => <CaptureGapMark key={`${g.kind}-${g.from}`} label={gapLabel(g)} className="nd-gapline" />;
   const moments = screens?.moments ?? [];
   const shown = (m: ScreenMoment) => <Fragment key={m.id}>{screens?.row(m)}</Fragment>;
+  // A moment attached to a line shown comes right after it; any other is placed by when it appeared.
+  const ids = new Set(lines.map((l) => l.id));
+  const attached = new Map<string, ScreenMoment[]>();
+  for (const m of moments) if (m.line !== null && ids.has(m.line)) attached.set(m.line, [...(attached.get(m.line) ?? []), m]);
+  const byTime = moments.filter((m) => m.line === null || !ids.has(m.line));
   return (
     <div className={cn('nd-lines', !lines.some((l) => l.speaker) && 'is-nameless', className)}>
       {lines.map((l, i) => {
         const before = gapsBefore(gaps, lines, i);
-        const up = gapsBefore(moments, lines, i);
+        const up = gapsBefore(byTime, lines, i);
+        const prev = lines[i - 1];
+        const after = attached.get(l.id) ?? [];
         // After a gap, or a screen, the speaker is named again: it's a new part of the call.
-        const more = !!l.speaker && voiceOf(lines[i - 1]?.speaker) === voiceOf(l.speaker) && !before.length && !up.length;
-        return <Fragment key={l.id}>{before.map(gap)}{up.map(shown)}<LineRow line={l} more={more} id={i === here ? MOMENT : undefined} on={i === on} kind={kinds?.get(l.id)} onSeek={onSeek} me={me} correct={correct} fromLine={fromLine} marks={marks} /></Fragment>;
+        const more = !!l.speaker && voiceOf(lines[i - 1]?.speaker) === voiceOf(l.speaker) && !before.length && !up.length && !(prev && attached.has(prev.id));
+        return <Fragment key={l.id}>{before.map(gap)}{up.map(shown)}<LineRow line={l} more={more} id={i === here ? MOMENT : undefined} on={i === on} kind={kinds?.get(l.id)} onSeek={onSeek} me={me} correct={correct} fromLine={fromLine} marks={marks} />{after.map(shown)}</Fragment>;
       })}
       {gapsAfter(gaps, lines).map(gap)}
-      {gapsAfter(moments, lines).map(shown)}
+      {gapsAfter(byTime, lines).map(shown)}
     </div>
   );
 }

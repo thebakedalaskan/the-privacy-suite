@@ -8,9 +8,11 @@
  * screen's.
  */
 import { errorMessage, notesAreOn, type CallRole, type CallState, type NotesRequest, type Person } from '@alcove/api';
-import { Avatar, Button, CaptureParts, CaptureSign, Faces, Icon, IconButton, Popover, Switch, cn, useToast } from '@alcove/ui';
+import { Avatar, Button, CaptureParts, CaptureSign, Faces, Icon, IconButton, Popover, Select, cn, useToast } from '@alcove/ui';
 import { useEffect, useRef, useState } from 'react';
 import { captureHere, changedLine } from '~/lib/capture';
+import { useVisionModels } from '~/lib/queries';
+import { screenModelOf, screenModelOptions, screenModelValue } from '~/lib/screenModels';
 import { callName, listNames } from '~/lib/people';
 import { hm } from '~/lib/time';
 import { capital } from '~/lib/words';
@@ -22,8 +24,8 @@ export interface CaptureControls {
   /** The organizer: hold all capture, or carry on. */
   pause: () => void;
   resume: () => void;
-  /** The organizer: have shared screens read for the notes, or stop it. */
-  screens: (on: boolean) => void;
+  /** The organizer: the model that reads shared screens for this call's notes, or the notes model (null). */
+  screenModel: (model: string | null) => void;
   /** Anyone else: ask for notes, or take the ask back. */
   ask: (up: boolean) => void;
   /** The organizer, in a breakout room: pause notes there, or carry on. The call's notes don't change. */
@@ -71,16 +73,19 @@ function CaptureDetails({ state, role, getting, controls, done, onOpenNotes }: {
   const askers = call.requests.map((r) => askerOf(state, r));
   const mine = !host ? call.asked : null;
   const run = (f: () => void) => () => { done(); f(); };
+  // Only the organizer chooses, so only their browser asks which models there are.
+  const models = useVisionModels(host);
   return (
     <>
       <div className="cap-h"><CaptureSign mode={c.mode} requested={!notesAreOn(c.mode) && c.requests.length > 0} />{when && <span className="when">{when}</span>}</div>
       <p className="cap-said">{saidFor(state, c, name)}</p>
       <CaptureParts capture={c} taker={state.isHost ? 'you' : takerName(state)} />
-      {/* The call's shared screens, so it's the call's state, and not shown in a breakout room, where nothing shared is read. */}
-      {host && !call.room && call.mode !== 'off' && (
+      {/* The call's choice, so not shown in a breakout room, where nothing shared is kept. Each presenter says whether their share goes in the notes. */}
+      {host && !call.room && (
         <div className="cap-screens">
-          <span><b>Read shared screens</b><small>What anyone shares is read for the notes, from their own browser. Cameras never are.</small></span>
-          <Switch checked={call.screen.mode !== 'off'} label="Read shared screens for the notes" onChange={(on) => controls.screens(on)} />
+          <span><b>Screens read by</b><small>Shares that their presenter puts in the notes are read by this model after the call. Cameras never are.</small></span>
+          <Select<string> label="Screens read by" value={screenModelValue(call.screenModel)} options={screenModelOptions(models.data ?? [], call.screenModel)}
+            align="end" onChange={(v) => controls.screenModel(screenModelOf(v))} />
         </div>
       )}
       <div className="cap-facts">

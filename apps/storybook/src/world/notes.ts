@@ -3,7 +3,7 @@
  * data-note.js): what each call was, who has it, what was said and what the notes wrote down. All made up. Times are on
  * the demo clock: day 0 is Wednesday 4 November 2026, -1 the Tuesday before, and so on.
  */
-import type { Note, NoteAddition, PersonalEntry, ScreenMoment } from '@alcove/api';
+import type { Note, NoteAddition, PersonalEntry, ScreenMoment, ScreenShare } from '@alcove/api';
 import { iso } from './clock';
 import { mmss, writeNote, type NoteSpec } from './build';
 import { AIKO, ART, DIEGO, INES, KOFI, LENA, MAYA, PRIYA } from './people';
@@ -35,7 +35,21 @@ export const LAUNCH_CHECKLIST: ScreenMoment = {
   legible: 'clear', title: 'Launch checklist',
   text: 'Launch checklist\nHelp article for support\nFlag in the rollout plan\nEmpty state on the team page',
   description: 'Kofi’s launch checklist, with two of its items still open: the empty state on the team page and the flag’s name in the rollout plan.',
-  regions: [{ label: 'The open items', x: 0.05, y: 0.3, w: 0.6, h: 0.4 }]
+  regions: [{ label: 'The open items', x: 0.05, y: 0.3, w: 0.6, h: 0.4 }],
+  relevance: 'key', cue: 'I can look after this.', line: 'l16'
+};
+/* The same share a little later, when Kofi moves to the rollout plan. */
+export const ROLLOUT_PLAN: ScreenMoment = {
+  id: 'n2-s2', at: mmss('10:05'), until: mmss('10:40'), presenter: { name: KOFI.name, person: KOFI }, share: 'TR_kofi1', width: 1920, height: 1080,
+  legible: 'clear', title: 'Rollout plan', text: 'Rollout plan\nOnboarding flag: new-first-run\nStart at one per cent',
+  description: 'The rollout plan, where Kofi adds the flag for the new onboarding as he says it.',
+  regions: [{ label: 'The flag', x: 0.05, y: 0.3, w: 0.6, h: 0.1 }],
+  relevance: 'supporting', cue: 'I’ll put the flag in the rollout plan now, that one’s quick.', line: 'l18'
+};
+/* Kofi's share, kept for the notes: it ran from 08:52 to 10:40, in the recording's one segment. */
+export const KOFI_SHARE: ScreenShare = {
+  id: 'TR_kofi1', presenter: { name: KOFI.name, person: KOFI }, label: 'Kofi’s screen', at: mmss('08:52'), until: mmss('10:40'),
+  segments: [{ segment: 0, at: mmss('08:52'), until: mmss('10:40') }]
 };
 const standup: NoteSpec = {
   id: 'n2', title: 'Team standup', startedAt: iso(0, 9, 0), minutes: 20, organizer: ART, invited: [PRIYA, KOFI, MAYA],
@@ -81,7 +95,8 @@ const standup: NoteSpec = {
     { id: 'n2-a2', text: 'Write the help article for support', at: '06:20', owner: PRIYA, takenOn: true, due: 'Friday' },
     { id: 'n2-a3', text: 'Add the flag to the rollout plan', at: '10:05', owner: KOFI, takenOn: true, done: true }
   ],
-  screens: [LAUNCH_CHECKLIST]
+  screens: [LAUNCH_CHECKLIST, ROLLOUT_PLAN],
+  shares: [KOFI_SHARE]
 };
 
 const pricing: NoteSpec = {

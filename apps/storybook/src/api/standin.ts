@@ -7,7 +7,7 @@
  *
  * A method nothing renders yet answers with something sensible and empty. When the contract grows, this grows with it.
  */
-import type { DocAskBody, DocAskPart } from '@alcove/api';
+import type { DocAskBody, DocAskPart, VisionModel } from '@alcove/api';
 import {
   AlcoveApiError, DEFAULT_NOTES_CHOICES, searchOf, termsIn, type ActionPatch, type ActionProposal, type AlcoveApi, type AnswerPart, type Busy, type CallCard,
   type CallDocument, type CallSession, type Change, type ChangeScope, type DecisionPatch, type DecisionProposal, type ID, type Inbox, type IncomingRing,
@@ -305,7 +305,7 @@ export const standIn: AlcoveApi = {
       w.prefs = {
         notesDefault: patch.notesDefault ?? p.notesDefault, notesLanguage: patch.notesLanguage ?? p.notesLanguage, summaryLength: patch.summaryLength ?? p.summaryLength,
         addToCalendar: patch.addToCalendar ?? p.addToCalendar, showOtherMeetings: patch.showOtherMeetings ?? p.showOtherMeetings, recordOffline: patch.recordOffline ?? p.recordOffline,
-        notifications: patch.notifications ?? p.notifications, pinned: patch.pinned ?? p.pinned, groups: patch.groups ?? p.groups
+        notifications: patch.notifications ?? p.notifications, pinned: patch.pinned ?? p.pinned, groups: patch.groups ?? p.groups, screenModel: patch.screenModel === undefined ? p.screenModel : patch.screenModel
       };
       return w.prefs;
     }),
@@ -447,6 +447,8 @@ export const standIn: AlcoveApi = {
       return audioUrlFor(`${id}:${segment}`, seconds);
     },
     audio: (id: ID, segment: number) => answer((w) => noteIn(w, id).audio.find((a) => a.index === segment)?.seconds ?? 60).then(quietAudio),
+    // The stand-in keeps no video of a share: this address answers 404, so the replay's stage stays dark and the page logs a warning.
+    screenVideoUrl: (id: ID, share: ID, segment: number) => `/storybook-no-screen-video/${id}/${share}/${segment}`,
     screenUrl: (id: ID, frameId: ID) => screenImage(current().notes.find((n) => n.id === id)?.screens.find((s) => s.id === frameId)),
     proposeDecision: (noteId: ID, p: DecisionProposal) => changeNote(noteId, (n) => ({
       ...n, decisions: [...n.decisions, { id: nextId('d'), text: p.text, state: 'proposed', lines: p.lines ?? [], against: [], disputes: [], changes: [changeBy(n, 'proposed')], evidence: { moments: [], flags: p.lines?.length ? [] : ['missing'] } }]
@@ -506,8 +508,14 @@ export const standIn: AlcoveApi = {
         };
       }) ?? null
     })),
-    rewrite: (noteId: ID) => changeNote(noteId, (n, w) => {
-      w.writing = { id: noteId, seconds: 5, written: () => ({ ...noteIn(current(), noteId), writingAgain: false, writtenAt: new Date().toISOString() }) };
+    rewrite: (noteId: ID, o?: { screenModel?: string | null | undefined }) => changeNote(noteId, (n, w) => {
+      w.writing = {
+        id: noteId, seconds: 5,
+        written: () => {
+          const was = noteIn(current(), noteId);
+          return { ...was, writingAgain: false, writtenAt: new Date().toISOString(), screenModel: o?.screenModel === undefined ? was.screenModel : o.screenModel };
+        }
+      };
       return { ...n, writingAgain: true };
     }),
     ask: (noteId: ID, question: string) => stream((w) => asWritten(answerAbout(noteIn(w, noteId), question))),
@@ -616,6 +624,12 @@ export const standIn: AlcoveApi = {
     searchText: (id: ID) => spaces.searchText(id)
   },
   credits: { balance: () => answer((w) => w.credits) },
+  models: {
+    vision: () => answer((): VisionModel[] => [
+      { id: 'near/stand-in-vision-large', name: 'Stand-in Vision Large' },
+      { id: 'near/stand-in-vision-small', name: 'Stand-in Vision Small' }
+    ])
+  },
   trust: { attestation: attest },
   diagnostics: { report: () => Promise.resolve() }
 };

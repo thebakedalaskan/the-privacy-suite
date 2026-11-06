@@ -3,7 +3,7 @@
  * NEAR AI. LiveKit carries media, presence, the server's nudges and what browsers send each other (pointers and marks on
  * shared screens, encrypted end to end like media); the API decides who may join and keeps the call.
  */
-import { AccessToken, DataPacket_Kind, RoomServiceClient, TrackSource, WebhookReceiver } from 'livekit-server-sdk';
+import { AccessToken, DataPacket_Kind, RoomServiceClient, WebhookReceiver } from 'livekit-server-sdk';
 import { AuthError } from './errors';
 import type { Config } from './config';
 import { log } from './log';
@@ -17,11 +17,6 @@ export interface LiveKit {
   ensureRoom(roomName: string): Promise<void>;
   /** Who is connected to the room now; empty when the room doesn't exist. */
   participants(roomName: string): Promise<{ identity: string; name: string }[]>;
-  /**
-   * The screens being shared in the room now: who shares each (identity) and its track ID. LiveKit sees which tracks
-   * are screens, never what's on them (frames are end-to-end encrypted). Cameras aren't listed.
-   */
-  screenShares(roomName: string): Promise<{ identity: string; sid: string }[]>;
   /**
    * A join token for one identity in one room. No admin rights: host powers stay in the API. It may send data: browsers
    * send each other pointers and marks on shared screens, encrypted end to end with their own media keys. The API is
@@ -71,10 +66,6 @@ export function createLiveKit(cfg: Config): LiveKit {
     async participants(roomName) {
       if (!(await rooms.listRooms([roomName])).length) return [];
       return (await rooms.listParticipants(roomName)).map((p) => ({ identity: p.identity, name: p.name }));
-    },
-    async screenShares(roomName) {
-      if (!(await rooms.listRooms([roomName])).length) return [];
-      return (await rooms.listParticipants(roomName)).flatMap((p) => p.tracks.filter((t) => t.source === TrackSource.SCREEN_SHARE).map((t) => ({ identity: p.identity, sid: t.sid })));
     },
     async token({ roomName, identity }) {
       const t = new AccessToken(cfg.LIVEKIT_API_KEY, cfg.LIVEKIT_API_SECRET, { identity, ttl: TOKEN_TTL_SECONDS });

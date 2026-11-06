@@ -14,7 +14,6 @@ import { stateOf } from '~/features/call/access';
 import { useCaptions } from '~/features/call/captions';
 import { CamMenu, CamOptions, MicMenu, MicOptions } from '~/features/call/DevicePickers';
 import { useDevices } from '~/features/call/devices';
-import { ScreenFrames } from '~/features/call/frames';
 import { HostSpill, organizerFirst } from '~/features/call/Hosting';
 import { LeaveSheet, type Ended, type NextHost } from '~/features/call/LeaveSheet';
 import { copyUrl, shownUrl, useCopyLink } from '~/features/call/links';
@@ -38,6 +37,7 @@ import { captureHere } from '~/lib/capture';
 import { RoomsLive, RoomsSetup, type RoomActivity, type RoomCandidate } from '~/features/call/Rooms';
 import { MAX_SHARES, SHARE_PROBLEMS, canShareScreen, type ShareProblem } from '~/features/call/share';
 import { keepSeen, seenNotices } from '~/features/call/seen';
+import { ScreenRecorder } from '~/features/call/screenRecord';
 import { SharePicker } from '~/features/call/SharePicker';
 import { VideoQuality } from '~/features/call/VideoQuality';
 import { CallEars, canListen } from '~/features/call/speech';
@@ -66,8 +66,21 @@ type Pop = 'mic' | 'cam' | 'cc' | 'cap' | 'more' | 'devices' | 'quality' | null;
 /** Time left in the rooms, as the rooms show it: 4:12. */
 const mmss = (s: number) => `${Math.floor(Math.max(0, s) / 60)}:${String(Math.floor(Math.max(0, s) % 60)).padStart(2, '0')}`;
 const SOMEONE: Person = { id: 'someone', name: 'Someone', email: '' };
-/** Whether what someone starts sharing is read for the notes: now, once notes resume, or not. */
-const screenRead = (mode: CaptureMode): 'on' | 'paused' | undefined => (mode === 'on' || mode === 'paused' ? mode : undefined);
+/** Whether someone starting to share is asked if it goes in the notes: while notes are on, or paused (kept once they resume). */
+const screenRead = (mode: CaptureMode): 'on' | 'paused' | undefined => (notesAreOn(mode) ? 'on' : mode === 'paused' ? 'paused' : undefined);
+/** Your share as the call knows it: its ID, whether you said it goes in the notes, the picture it is, and when that started (performance.now()). */
+interface MyShare { share: string; keep: boolean; stream: MediaStream; since: number }
+/**
+ * When the current segment of the recording began, from performance.now(), for a page that opens part-way through one
+ * (a reload): from when the call says recording last changed, which is when the segment began unless the host's browser
+ * dropped out meanwhile. Otherwise (and when that's in the future here), now.
+ */
+function segmentOrigin(state: CallState): number {
+  const now = performance.now();
+  const since = state.capture.recording.mode === 'on' ? state.capture.recording.since : null;
+  const ago = since ? Date.now() - Date.parse(since) : 0;
+  return Number.isFinite(ago) && ago > 0 ? now - ago : now;
+}
 /** Before the room has connected: nobody's media yet. */
 const NO_VIEW: RoomView = { connection: 'connecting', endReason: null, people: {}, hostMuted: 0, audioBlocked: false, screenFailed: null };
 const NO_ROOM: CallRoom = {
@@ -167,7 +180,7 @@ function InCall({ session }: { session: CallSession }) {
   const [cantRecord, setCantRecord] = useState(false);
   const [cantListen, setCantListen] = useState(() => !canListen());
   const [pausing, setPausing] = useState(false);
-  const [frameProblem, setFrameProblem] = useState<string | null>(null);
+  const [screenProblem, setScreenProblem] = useState<string | null>(null);
   // Your own view of the call (never sent anywhere): how you like calls, remembered for your account, and how you
   // arranged this one, kept in this tab until you leave it.
   const account = useQuery(q.session());
@@ -339,28 +352,50 @@ function InCall({ session }: { session: CallSession }) {
   }, [crypto.place]);
 
   /*
-   * Your own shared screen, while screen notes are on: this browser looks at it and sends what changes to the notes
-   * (features/call/frames.ts). Paused, off, or in a breakout room, it stops at once and drops what wasn't sent; a share
-   * that ends says so, so its last frame stops there in the notes.
+   * Your own shared screen, when you said it goes in the notes (features/call/screenRecord.ts): this browser records it
+   * while notes are on, the call is live and you aren't in a breakout room, from ten seconds after it started. Paused or
+   * off, it stops at once and drops what wasn't sent; resuming records into the new segment. A share that ends (stopped,
+   * or swapped for something else) sends its last piece, then says so, so its video stops there in the notes.
    */
-  const frames = useRef<ScreenFrames | null>(null);
-  if (!frames.current) frames.current = new ScreenFrames((f) => session.shareFrame(f), (share) => session.shareEnded(share), setFrameProblem);
+  const screens = useRef<ScreenRecorder | null>(null);
+  if (!screens.current) screens.current = new ScreenRecorder((p) => session.appendScreen(p), setScreenProblem);
   const myShare = roomView.people[self]?.screenSid ?? null;
-  const screensOn = state.capture.screen.mode === 'on';
   const sharingInRoom = !!state.breakouts.open?.rooms.some((r) => r.members.includes(self));
+  const [mine, setMineNow] = useState<MyShare | null>(null);
+  const mineRef = useRef<MyShare | null>(null);
+  const setMine = (v: MyShare | null) => { mineRef.current = v; setMineNow(v); };
+  /** Your last share's end, on its way: a new share starts once the call knows the last one ended. */
+  const ending = useRef<Promise<void>>(Promise.resolve());
+  const endMine = () => {
+    const was = mineRef.current;
+    if (!was) return;
+    setMine(null);
+    const r = screens.current;
+    ending.current = (r ? r.finish() : Promise.resolve()).then(() => session.shareEnded(was.share))
+      .catch((e: unknown) => clog.info('the end of a share wasn’t recorded', { err: e }));
+  };
+  // The call's word on whether your share is kept: notes going off ends that, and a share it doesn't know isn't.
+  const keptMine = mine ? state.shares.find((s) => s.id === mine.share)?.keep ?? mine.keep : false;
+  const recordScreen = !!mine && keptMine && on && live && !sharingInRoom && !leaving && !ended && m.screen === mine.stream;
+  const segmentSeen = useRef<{ segment: number; on: boolean; origin: number } | null>(null);
   useEffect(() => {
-    const f = frames.current;
-    if (!f) return;
-    if (m.screen && myShare && screensOn && live && !sharingInRoom) f.start(m.screen, myShare);
-    else f.stop();
-  }, [m.screen, myShare, screensOn, live, sharingInRoom]);
-  const lastShare = useRef<string | null>(null);
-  useEffect(() => {
-    const was = lastShare.current;
-    lastShare.current = myShare;
-    if (was && was !== myShare) frames.current?.end(was);
-  }, [myShare]);
-  useEffect(() => () => frames.current?.stop(), []);
+    const r = screens.current;
+    if (!r) return;
+    const seen = segmentSeen.current;
+    // A segment this page saw begin counts from then; the one it opened in, from when the call says it began. The first
+    // segment is 0 before notes are ever on too, so notes coming on begins one.
+    if (!seen) segmentSeen.current = { segment, on, origin: on ? segmentOrigin(state) : performance.now() };
+    else if (seen.segment !== segment || (on && !seen.on)) segmentSeen.current = { segment, on, origin: performance.now() };
+    else if (seen.on !== on) segmentSeen.current = { ...seen, on };
+    const origin = segmentSeen.current?.origin ?? performance.now();
+    if (recordScreen && mine) r.record({ stream: mine.stream, share: mine.share, since: mine.since, segment, origin });
+    else if (!on || leaving || ended) r.discard();
+    else void r.finish();
+    // `state` is read only for a segment this page didn't see begin.
+  }, [recordScreen, mine, segment, on, leaving, ended]);
+  // What you share stopped, or something else took its place: that share is over.
+  useEffect(() => { if (mine && m.screen !== mine.stream) endMine(); });
+  useEffect(() => () => screens.current?.discard(), []);
 
   /* What the call says happened ("Notes are on…") arrives once, as a toast. Joining shows only the latest: the rest is history. */
   const shown = useRef<Set<string> | null>(null);
@@ -656,7 +691,7 @@ function InCall({ session }: { session: CallSession }) {
   const closedFor = (owner: string, mine: boolean): 'call' | 'presenter' | null => (!state.pointing ? 'call' : mine || othersPointAt(owner) ? null : 'presenter');
   const shares: StageShare[] = [
     ...(m.screen ? [{
-      id: meId, feed: { stream: m.screen }, presenter: me?.person ?? SOMEONE, mine: true, label: `You’re sharing ${m.screenLabel ?? 'your screen'}`, name: 'Your screen', sound: null,
+      id: meId, feed: { stream: m.screen }, presenter: me?.person ?? SOMEONE, mine: true, label: `You’re sharing ${m.screenLabel ?? 'your screen'}`, name: 'Your screen', sound: null, kept: keptMine && !sharingInRoom,
       point: myShare ? { sid: myShare, closed: closedFor(meId, true) } : null
     }] : []),
     ...others.flatMap((p): StageShare[] => {
@@ -669,7 +704,8 @@ function InCall({ session }: { session: CallSession }) {
         muted: !on,
         toggle: () => { room.muteShare(sid, on); toast(on ? `${who}’s share is muted for you` : `${who}’s share plays its sound again`, { icon: on ? 'speakerOff' : 'speaker' }); }
       } : null;
-      return [{ id: p.id, feed: { room, sid }, presenter: p.person, mine: false, label: `${who} is sharing`, name: `${who}’s screen`, sound, point: { sid, closed: closedFor(p.id, false) } }];
+      const kept = state.shares.some((s) => s.participant === p.id && s.keep);
+      return [{ id: p.id, feed: { room, sid }, presenter: p.person, mine: false, label: `${who} is sharing`, name: `${who}’s screen`, sound, kept, point: { sid, closed: closedFor(p.id, false) } }];
     })
   ];
   /*
@@ -732,12 +768,37 @@ function InCall({ session }: { session: CallSession }) {
         else if (r.problem !== 'cancelled') reopen.current(r.problem);
         return;
       }
+      void startMine(c.notes);
       // The sound asked for didn't come (only asked where the browser can share it): its picker's switch was off, or
       // the computer wouldn't share it.
       if (r.sound !== 'left-out') return;
       toast(r.surface === 'browser' ? 'The tab’s sound isn’t shared. Change what you share and turn on Also share tab audio.' : 'Your computer’s sound isn’t shared here. A tab can share its sound.',
         { icon: 'speakerOff', ms: 9000, action: { label: 'Change', onClick: () => reopen.current() } });
     });
+  };
+  /**
+   * Tells the call about what you just started sharing, once the browser's picker has returned: the share it was in
+   * place of ends first. The answer says whether it's kept for the notes (never from a breakout room, nor with notes off).
+   */
+  const startMine = async (notes: boolean) => {
+    const stream = media.getSnapshot().screen;
+    if (!stream) return;
+    const since = performance.now();
+    if (mineRef.current && mineRef.current.stream !== stream) endMine();
+    await ending.current;
+    try {
+      const s = await session.startShare({ notes });
+      // Stopped meanwhile, or swapped again: this one is over already.
+      if (media.getSnapshot().screen !== stream) {
+        session.shareEnded(s.share).catch((e: unknown) => clog.info('the end of a share wasn’t recorded', { err: e }));
+        return;
+      }
+      setMine({ share: s.share, keep: s.keep, stream, since });
+      clog.info('share started', { notes, keep: s.keep });
+    } catch (e) {
+      clog.warn('the call didn’t take your share', { err: e, notes });
+      if (notes) toast('Your share couldn’t be added to the notes. Everyone here still sees it.', { icon: 'x', ms: 8000 });
+    }
   };
   /** Opens the share picker (saying why the last try didn't start, if it didn't), unless this browser can't share or four already are. */
   const pickShare = (trouble: Exclude<ShareProblem, 'cancelled' | 'unsupported'> | null = null) => {
@@ -858,7 +919,7 @@ function InCall({ session }: { session: CallSession }) {
       }).finally(() => setPausing(false));
     },
     resume: () => { session.resume().catch(failed); },
-    screens: (v) => { session.setScreens(v).catch(failed); },
+    screenModel: (model) => { session.setScreenModel(model).catch(failed); },
     // One breakout room: the voices there hold still while the pause is on its way, and what they held is dropped
     // once the server has paused the room. The recording and the call's notes carry on.
     room: (paused) => {
@@ -1125,7 +1186,7 @@ function InCall({ session }: { session: CallSession }) {
     <div className="ic-spill"><Icon name="screen" size={15} />
       <span className="tx2">{published ? <>You’re sharing <b>{m.screenLabel ?? 'your screen'}</b>{withSound && ' with sound'}</> : <>Starting to share <b>{m.screenLabel ?? 'your screen'}</b></>}</span>
       {!published && <Dots />}
-      {published && screensOn && !sharingInRoom && <span className="sp-read"><RecDot />Read for the notes</span>}
+      {published && keptMine && !sharingInRoom && <span className="sp-read"><RecDot />Read for the notes</span>}
       {published && state.pointing && (
         <Tooltip label={othersPoint ? 'Others can point at your screen. Press so only you can' : 'Only you can point at your screen. Press to let others'}>
           <button type="button" className={cn('sp-btn sp-ico', !othersPoint && 'is-off')} aria-pressed={othersPoint} aria-label="Others can point at your screen" onClick={flipOthersPoint}>
@@ -1288,7 +1349,7 @@ function InCall({ session }: { session: CallSession }) {
     : <RoomsSetup people={candidates} guests={guestsHere} onOpen={openRooms} />);
   const panelBody = (v: PanelView) => {
     switch (v) {
-      case 'notes': return <NotesView state={state} getting={getting} problems={[uploadError, heardProblem, frameProblem].filter((x): x is string => !!x)}
+      case 'notes': return <NotesView state={state} getting={getting} problems={[uploadError, heardProblem, screenProblem].filter((x): x is string => !!x)}
         controls={controls} carried={carried && <FromLastTime s={carried} me={account.data?.user.email} open={!state.liveNotes.notes} />} onSeek={cu.open} onTick={(id, done) => { session.tickFollowUp(id, done).catch(failed); }} onTranscript={() => openPanel('transcript')} />;
       case 'yours': return <YoursView own={own} state={state} me={me?.person.email} onOpen={cu.open} />;
       case 'transcript': return cu.moment
@@ -1421,7 +1482,7 @@ function InCall({ session }: { session: CallSession }) {
         </footer>
       </div>
       <SharePicker open={sharePick} onOpenChange={(o) => { setSharePick(o); if (!o) setShareTrouble(null); }} sharing={!!m.screen}
-        others={sharing.map((s) => s.presenter)} trouble={shareTrouble} read={sharingInRoom ? undefined : screenRead(state.capture.screen.mode)} onShare={share} />
+        others={sharing.map((s) => s.presenter)} trouble={shareTrouble} read={sharingInRoom || !state.capture.readScreens ? undefined : screenRead(state.capture.mode)} onShare={share} />
       <MoveSheet open={moving.open} onOpenChange={(o) => { if (!o) moving.hide(); }} move={moving.move} media={{ mic: m.mic, cam: m.cam }} account={state.role !== 'guest'}
         sharing={!!m.screen} onStopSharing={stopShare} onMove={() => void moving.go()} onAgain={moving.again} />
       <LeaveSheet open={leaveOpen || !!ended} onOpenChange={(o) => { setLeaveOpen(o); if (!o) guard.stay(); }} title={state.title} elapsed={state.elapsed}

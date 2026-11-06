@@ -24,7 +24,7 @@
  * however they've framed it, while they see it live.
  */
 import { CALL_SHARE_ROOM, CALL_SHARE_SPLIT, type CallPeopleMode, type Person, type SelfView, type StageCorner } from '@alcove/api';
-import { Avatar, Button, CallTile, CaptureSign, EmptyState, Icon, NotesSign, Tooltip, cn, useToast, volumeTag } from '@alcove/ui';
+import { Avatar, Button, CallTile, CaptureSign, EmptyState, Icon, NotesSign, RecDot, Tooltip, cn, useToast, volumeTag } from '@alcove/ui';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { useEffect, useMemo, useRef, useState, type FocusEvent as ReactFocusEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
@@ -67,6 +67,8 @@ export interface StageShare {
   name: string;
   /** The sound it carries, if any: muted for you or not, and the switch. Never for your own, which doesn't play here. */
   sound: { muted: boolean; toggle: () => void } | null;
+  /** Its presenter said it goes in the notes, and the call keeps it: it's recorded and read for them. */
+  kept: boolean;
   /**
    * Pointing at it: its picture's track sid, which pointers and marks name it by, and what keeps you from pointing at it
    * now, if anything (the organizer turned pointing off, or its presenter doesn't let others point). Null until the call's
@@ -563,7 +565,7 @@ export function Stage({ staged, frame, live: sizing, phone, people, waiting, sha
         const surface = look && 'room' in s.feed ? { look, feed: s.feed } : null;
         const canPoint = pointable(s);
         const here = pointingNow === s.id;
-        const said = [s.label, s.sound ? (s.sound.muted ? 'its sound muted for you' : 'with sound') : '', away ? 'in its own window, P brings it back' : big ? '' : 'a tile, P shows it big',
+        const said = [s.label, s.kept ? 'read for the notes' : '', s.sound ? (s.sound.muted ? 'its sound muted for you' : 'with sound') : '', away ? 'in its own window, P brings it back' : big ? '' : 'a tile, P shows it big',
           here ? 'you’re pointing at it: arrow keys move your pointer, Enter marks, Backspace takes your last mark back, Escape stops' : canPoint ? 'L to point at it' : ''];
         const shortcuts = `Enter P${canPoint ? ' L' : ''}${big && canMove ? ' G' : ''}${look ? ` ${LOOK_ARIA}` : ''}`;
         return (
@@ -592,6 +594,7 @@ export function Stage({ staged, frame, live: sizing, phone, people, waiting, sha
             })()}
             <span className="ac-tile-name">
               <Avatar person={s.presenter} size={18} /><span className="tl">{panels && !s.mine ? s.name : s.label}</span>
+              {s.kept && <Tooltip label="Read for the notes"><span className="rd"><RecDot /></span></Tooltip>}
               {s.sound && <Icon name={s.sound.muted ? 'speakerOff' : 'speaker'} size={14} className="snd" />}
             </span>
             {!big && !away && <span className="ic-sgrow" aria-hidden="true"><Icon name="grow" size={18} /></span>}

@@ -264,6 +264,10 @@ export const CallHostSchema = z.object({
 });
 export type CallHost = z.infer<typeof CallHostSchema>;
 
+/** A share going on in the call: its ID, whose it is (participant ID), and whether the presenter said it goes in the notes. */
+export const CallShareSchema = z.object({ id: IDSchema, participant: z.string(), keep: z.boolean() });
+export type CallShare = z.infer<typeof CallShareSchema>;
+
 export const CallStateSchema = z.object({
   callId: IDSchema,
   meetingId: IDSchema,
@@ -318,6 +322,11 @@ export const CallStateSchema = z.object({
   /** The board open in the part of the call you're in, as you may know it. Nothing for someone waiting to be let in. */
   board: CallBoardSchema,
   notices: z.array(CallNoticeSchema),
+  /**
+   * The shares going on now that the server knows of, by whose they are (a participant ID; each person shares one
+   * screen at a time), and whether each is kept for the notes: only those say they're read for the notes.
+   */
+  shares: z.array(CallShareSchema),
   /** Only the organizer can turn notes on or off, pause and resume them. */
   isOrganizer: z.boolean(),
   /** You host now (the organizer, or standing in for them): you let people in, mute, remove and lock, and can end the call. */
@@ -329,6 +338,10 @@ export const CallStateSchema = z.object({
   role: CallRoleSchema
 });
 export type CallState = z.infer<typeof CallStateSchema>;
+
+/** What the server answers when a share starts: its ID, whether it's kept for the notes, and the call as it is now. */
+export const ShareStartedSchema = z.object({ share: IDSchema, keep: z.boolean(), state: CallStateSchema });
+export type ShareStarted = z.infer<typeof ShareStartedSchema>;
 
 export const CallEndResultSchema = z.object({
   meetingId: IDSchema,
@@ -358,19 +371,6 @@ export interface TranscriptClip {
 }
 
 /**
- * A frame of the presenter's own shared screen, kept because the screen changed (docs: Calls and recordings › Shared
- * screens): JPEG bytes, which share it's from (its LiveKit track ID), and when it was taken (`Date.now()` then).
- */
-export interface ScreenFrame {
-  data: Blob;
-  share: string;
-  takenAt: number;
-}
-/** What the call kept of a frame: its ID, or the ID it already had if the same frame came before (a retry). */
-export const ScreenFrameReceiptSchema = z.object({ id: IDSchema, duplicate: z.boolean() });
-export type ScreenFrameReceipt = z.infer<typeof ScreenFrameReceiptSchema>;
-
-/**
  * A piece of recorded audio, as produced by MediaRecorder every few seconds. Sending a piece that's
  * stored already stores nothing new. A room recording takes such a resend even once it's paused or
  * stopped; a call refuses audio once notes are off or a later segment has begun.
@@ -380,6 +380,25 @@ export interface AudioPiece {
   /** Segment the piece belongs to (see RecordingProgress.segment). */
   segment: number;
   /** Position within the segment, starting at 0. */
+  seq: number;
+  /** Where the piece starts, in seconds from the start of its segment, pauses not counted. */
+  at: number;
+  durationMs: number;
+  mimeType: string;
+}
+
+/**
+ * A piece of a shared screen's video, recorded by the presenter's own browser every few seconds while the share is kept
+ * for the notes. Sending a piece that's stored already stores nothing new; a different piece in the same place is
+ * refused. The call refuses pieces of a share that wasn't kept, after it ended, and while notes are paused or off.
+ */
+export interface ScreenPiece {
+  data: Blob;
+  /** Which share it's from (`startShare`'s ID). */
+  share: string;
+  /** Segment of the recording the piece belongs to (see RecordingProgress.segment). */
+  segment: number;
+  /** Position within the share's video in this segment, starting at 0. */
   seq: number;
   /** Where the piece starts, in seconds from the start of its segment, pauses not counted. */
   at: number;
@@ -506,16 +525,19 @@ export interface CallSession extends LiveStore<CallState> {
   /** Whoever hosts, whose browser takes the notes: what it can't capture now (no microphone, or no way to record or listen), or none. */
   setUnavailable(parts: CaptureDevicePart[]): Promise<void>;
   /**
-   * Organizer only: has shared screens read for the notes, or stops it. Only while notes are on or paused; everyone
-   * sees it in `capture.screen`. Resolves once the server has done it.
+   * Organizer only: the vision model that reads shared screens for this call's notes (an ID from `models.vision()`), or
+   * the notes model (null). Everyone sees it in `capture.screenModel`. Resolves once the server has it.
    */
-  setScreens(on: boolean): Promise<void>;
+  setScreenModel(model: string | null): Promise<void>;
   /**
-   * The presenter's own browser: one frame of its own share, while screen notes are on and not paused. Refused for
-   * anyone else's share, for a camera, and from a breakout room. The same frame sent again is kept once.
+   * The presenter's own browser, once they've picked what to share: starts a share, and says whether it goes in the
+   * notes. `keep` says whether it does: never from a breakout room, and `notes` is refused while notes are off. Everyone
+   * sees it in `shares`.
    */
-  shareFrame(frame: ScreenFrame): Promise<ScreenFrameReceipt>;
-  /** The presenter's own browser: one of its shares ended, so what it showed last stops there in the notes. */
+  startShare(o: { notes: boolean }): Promise<{ share: string; keep: boolean }>;
+  /** The presenter's own browser: one piece of a kept share's video, encrypted and kept with the call's audio. */
+  appendScreen(piece: ScreenPiece): Promise<void>;
+  /** The presenter's own browser: one of its shares ended, so its video and what it showed stop there in the notes. */
   shareEnded(share: string): Promise<void>;
   /** Raises or lowers your hand; everyone in the call sees it. */
   setHand(up: boolean): void;

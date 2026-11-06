@@ -7,15 +7,16 @@
  * anything else is refused (docs: notes-and-inference › Prompts).
  */
 import {
-  firstName, type ActionItem, type AnswerPart, type CaptureGap, type Chapter, type Decision, type InferenceEvidence, type NoteKind, type NotesLanguage, type Person, type Question,
-  type RoomNote, type ScreenMoment, type ScreenRef, type Speaker, type SummaryLength, type TranscriptLine, type DocAskAction, type DocAskPart
+  MAX_SCREEN_FRAMES, firstName, type ActionItem, type AnswerPart, type CaptureGap, type Chapter, type Decision, type InferenceEvidence, type NoteKind, type NotesLanguage, type Person, type Question,
+  type RoomNote, type ScreenMoment, type ScreenRef, type ScreenRelevance, type ScreenShare, type Speaker, type SummaryLength, type TranscriptLine, type DocAskAction, type DocAskPart
 } from '@alcove/api';
 import { z } from 'zod';
 import type { Config } from '../config';
 import { id128 } from '../crypto';
 import { UnavailableError } from '../errors';
-import { complete, completeJson, jpegPart } from '../inference';
+import { complete, completeJson, jpegPart, type ChatModel } from '../inference';
 import type { NoteManifest } from './notes';
+import { changeOf } from './screenGrid';
 import type { Reading } from './screens';
 
 /** What the notes model writes into a note (shared screens described, too), and the verified model that wrote it. */
@@ -37,6 +38,12 @@ export interface Brief {
   gaps: CaptureGap[];
   /** What was on shared screens, as it was read, placed among the lines where it appeared. */
   screens?: ScreenMoment[] | undefined;
+  /**
+   * For writing the notes: each screen's frame on the grey grid (screenGrid.ts) by its ID, to say how it compares with
+   * its share's screen before it, and the shares (when each began).
+   */
+  grids?: ReadonlyMap<string, Uint8Array> | undefined;
+  shares?: ScreenShare[] | undefined;
   /** The written summary, for questions after the notes are written. */
   summary?: string | undefined;
   /** The meeting is still going on. */
@@ -137,20 +144,68 @@ function gapLine(g: CaptureGap, now: number): string {
     : `-- at ${mmss(g.at)} notes went ${kind}, ${long} ago: nothing said since was recorded --`;
 }
 /**
- * How much of a screen's text is kept: what the notes model reads among the lines, and what the note shows. The
- * note keeps every frame's reading, and every edit copies the note, so it stays short.
+ * How much of a screen's text is kept: what a question about the note reads among the lines, and what the note shows.
+ * The note keeps every attached frame's reading, and every edit copies the note, so it stays short.
  */
 const SCREEN_TEXT_CHARS = 700;
+/** How much of a screen's text the notes model reads while writing the notes: a long share can have hundreds of frames. */
+const NOTES_SCREEN_CHARS = 300;
 const LEGIBLE: Record<ScreenMoment['legible'], string> = { clear: 'clear', partly: 'partly legible', unreadable: 'unreadable', unread: 'not read' };
 /**
- * A shared screen as the model reads it, numbered from 1: "[mm:ss] [screen N from Name, clear] Title. Reads: … Parts:
- * (1) … (2) …", with only what was read on it.
+ * A shared screen as the model reads it, numbered from 1: "[mm:ss] [screen N from Name, clear, key, hint] Title.
+ * Reads: … Parts: (1) … (2) …", with only what was read on it, at most `chars` of its text. "key" marks a screen what
+ * was said refers to or relies on; the hint, when there is one, says how it compares with its share's screen before.
  */
-function screenLine(m: ScreenMoment, n: number): string {
+function screenLine(m: ScreenMoment, n: number, chars: number, hint?: string | undefined): string {
   const from = m.presenter ? ` from ${saidBy(m.presenter)}` : '';
-  const reads = m.text.trim() ? ` Reads: ${clip(unfenced(m.text).replace(/\s*\n\s*/g, ' / ').trim(), SCREEN_TEXT_CHARS)}` : '';
+  const reads = m.text.trim() ? ` Reads: ${clip(unfenced(m.text).replace(/\s*\n\s*/g, ' / ').trim(), chars)}` : '';
   const parts = m.regions.length ? ` Parts: ${m.regions.map((r, i) => `(${i + 1}) ${oneLine(r.label)}`).join(' ')}` : '';
-  return `[${mmss(m.at)}] [screen ${n}${from}, ${LEGIBLE[m.legible]}] ${oneLine(m.title) || 'Untitled'}.${reads}${parts}`;
+  return `[${mmss(m.at)}] [screen ${n}${from}, ${LEGIBLE[m.legible]}${m.relevance === 'key' ? ', key' : ''}${hint ? `, ${hint}` : ''}] ${oneLine(m.title) || 'Untitled'}.${reads}${parts}`;
+}
+/** A line about shared screens, at the second it goes among the transcript's lines. */
+interface Placed { at: number; text: string }
+/** Shared screens as a question about the note reads them: each numbered from 1, in full. */
+const placed = (shown: ScreenMoment[]): Placed[] => shown.map((m, i) => ({ at: m.at, text: screenLine(m, i + 1, SCREEN_TEXT_CHARS) }));
+/** Numbers in order, as "4–6, 8": a run of consecutive ones as a range. */
+function ranges(ns: number[]): string {
+  const out: string[] = [];
+  for (let i = 0; i < ns.length;) {
+    let j = i;
+    while (j + 1 < ns.length && ns[j + 1] === (ns[j] ?? 0) + 1) j++;
+    out.push(j > i ? `${ns[i] ?? ''}–${ns[j] ?? ''}` : `${ns[i] ?? ''}`);
+    i = j + 1;
+  }
+  return out.join(', ');
+}
+/**
+ * Shared screens as the notes model reads them (`shown` in order), each numbered from 1, with how it compares with its
+ * share's last screen given in full, by their grids: "first of this share", "changed a little since screen 3" or
+ * "changed a lot since screen 3" (nothing when either has no grid). Screens that look the same as that one go on one
+ * line, where the first of them was, without their readings: "[mm:ss–mm:ss] [screens 4–9 same as screen 3]". Only
+ * screens given in full carry what was read on them, at most NOTES_SCREEN_CHARS of it.
+ */
+function compared(shown: ScreenMoment[], grids: ReadonlyMap<string, Uint8Array>): Placed[] {
+  const out: Placed[] = [];
+  const last = new Map<string, { n: number; grid: Uint8Array | undefined; run: { at: number; until: number; ns: number[]; slot: number } | null }>();
+  shown.forEach((m, i) => {
+    const n = i + 1;
+    const grid = grids.get(m.id);
+    const ref = last.get(m.share);
+    const change = ref ? changeOf(ref.grid, grid) : null;
+    if (ref && change === 'same') {
+      const run = ref.run ?? { at: m.at, until: m.at, ns: [], slot: out.push({ at: m.at, text: '' }) - 1 };
+      run.ns.push(n);
+      run.until = m.at;
+      ref.run = run;
+      const when = mmss(run.until) === mmss(run.at) ? mmss(run.at) : `${mmss(run.at)}–${mmss(run.until)}`;
+      out[run.slot] = { at: run.at, text: `[${when}] [screen${run.ns.length > 1 ? 's' : ''} ${ranges(run.ns)} same as screen ${ref.n}]` };
+      return;
+    }
+    const hint = !ref ? 'first of this share' : change === null || change === 'unknown' ? undefined : `changed ${change} since screen ${ref.n}`;
+    out.push({ at: m.at, text: screenLine(m, n, NOTES_SCREEN_CHARS, hint) });
+    last.set(m.share, { n, grid, run: null });
+  });
+  return out;
 }
 /**
  * One line of the transcript as the model reads it: "[mm:ss] Name: words", or "[mm:ss] words" when nobody can tell who
@@ -160,22 +215,22 @@ function screenLine(m: ScreenMoment, n: number): string {
 const spoken = (l: TranscriptLine) =>
   `[${mmss(l.at)}] ${l.speaker ? `${saidBy(l.speaker)}${l.unsure?.speaker ? ' (not sure who)' : ''}: ` : ''}${oneLine(l.text)}${l.unsure?.words ? ' (unclear)' : ''}`;
 /**
- * The transcript in order, each entry a line (by its index), a "--" line where nothing was captured, or a "[screen N"
- * line where a shared screen changed.
+ * The transcript in order, each entry a line (by its index), a "--" line where nothing was captured, or a line about
+ * shared screens (`screens`, in order) where one appeared.
  */
 type Entry = { text: string; line: number | null };
-function entries(lines: TranscriptLine[], gaps: CaptureGap[], label: (l: TranscriptLine, i: number) => string, screens: ScreenMoment[] = []): Entry[] {
+function entries(lines: TranscriptLine[], gaps: CaptureGap[], label: (l: TranscriptLine, i: number) => string, screens: Placed[] = []): Entry[] {
   const now = Date.now();
   const out: Entry[] = [];
   let g = 0;
   let sc = 0;
   lines.forEach((l, i) => {
     for (; g < gaps.length && (gaps[g]?.at ?? 0) <= l.at; g++) { const gap = gaps[g]; if (gap) out.push({ text: gapLine(gap, now), line: null }); }
-    for (; sc < screens.length && (screens[sc]?.at ?? 0) <= l.at; sc++) { const m = screens[sc]; if (m) out.push({ text: screenLine(m, sc + 1), line: null }); }
+    for (; sc < screens.length && (screens[sc]?.at ?? 0) <= l.at; sc++) { const m = screens[sc]; if (m) out.push({ text: m.text, line: null }); }
     out.push({ text: label(l, i), line: i });
   });
   for (const gap of gaps.slice(g)) out.push({ text: gapLine(gap, now), line: null });
-  for (; sc < screens.length; sc++) { const m = screens[sc]; if (m) out.push({ text: screenLine(m, sc + 1), line: null }); }
+  for (; sc < screens.length; sc++) { const m = screens[sc]; if (m) out.push({ text: m.text, line: null }); }
   return out;
 }
 /** Which lines didn't fit and were left out of what the model read: how many, and the first and last of them (by index). */
@@ -217,7 +272,7 @@ function fit(all: Entry[], max = MAX_TRANSCRIPT_CHARS): { text: string; kept: Se
  * each keeps a share of it in proportion to its length, so together they're no longer than one transcript may be.
  */
 function fitTogether(parts: { lines: TranscriptLine[]; gaps: CaptureGap[]; screens: ScreenMoment[] }[]): string[] {
-  const all = parts.map((p) => entries(p.lines, p.gaps, spoken, p.screens));
+  const all = parts.map((p) => entries(p.lines, p.gaps, spoken, placed(p.screens)));
   const sizes = all.map((es) => es.reduce((n, e) => n + e.text.length + 1, 0));
   const total = sizes.reduce((n, x) => n + x, 0);
   return all.map((es, i) => fit(es, total <= MAX_TRANSCRIPT_CHARS ? MAX_TRANSCRIPT_CHARS : Math.floor((MAX_TRANSCRIPT_CHARS * (sizes[i] ?? 0)) / total)).text);
@@ -227,7 +282,8 @@ function fitTogether(parts: { lines: TranscriptLine[]; gaps: CaptureGap[]; scree
  * line where nothing was captured and a "[screen N" line where a shared screen changed. `kept` are the lines the model
  * was shown, so it can only point at lines it read.
  */
-const numberedText = (lines: TranscriptLine[], gaps: CaptureGap[], screens: ScreenMoment[] = []) => fit(entries(lines, gaps, (l, i) => `L${i + 1} ${spoken(l)}`, screens));
+const numberedText = (lines: TranscriptLine[], gaps: CaptureGap[], screens: ScreenMoment[] = [], grids: ReadonlyMap<string, Uint8Array> = new Map()) =>
+  fit(entries(lines, gaps, (l, i) => `L${i + 1} ${spoken(l)}`, compared(screens, grids)));
 /**
  * What people said (and what was on their screens), fenced, so the model reads it as the meeting and nothing else: a
  * line that asks it to do something is still only something someone said or showed.
@@ -283,7 +339,7 @@ Some follow-ups were ticked as done during the call. They're listed before the t
 
 /** The system prompt for writing notes in a style. Only the summary's length and the language change; everything else is asked the same way. */
 export const notesPrompt = (style: NotesStyle, ticked: boolean): string => `You write the notes for a meeting from its transcript. Reply with a single JSON object and nothing else, in this shape:
-{"summary": string, "decisions": [{"text": string, "at": number, "lines": [number], "against": [number], "screen": number | null, "part": number | null, "sure": boolean}], "questions": [{"text": string, "at": number, "lines": [number], "against": [number], "screen": number | null, "part": number | null, "sure": boolean}], "actions": [{"text": string, "owner": string | null, "due": string | null, "at": number, "lines": [number], "against": [number], "screen": number | null, "part": number | null, "sure": boolean}], "chapters": [{"at": number, "title": string, "summary": string, "screen": number | null, "part": number | null, "sure": boolean}], "suggestedQuestions": [string], "screens": [{"n": number, "description": string}]}
+{"summary": string, "decisions": [{"text": string, "at": number, "lines": [number], "against": [number], "screen": number | null, "part": number | null, "sure": boolean}], "questions": [{"text": string, "at": number, "lines": [number], "against": [number], "screen": number | null, "part": number | null, "sure": boolean}], "actions": [{"text": string, "owner": string | null, "due": string | null, "at": number, "lines": [number], "against": [number], "screen": number | null, "part": number | null, "sure": boolean}], "chapters": [{"at": number, "title": string, "summary": string, "screen": number | null, "part": number | null, "sure": boolean}], "suggestedQuestions": [string], "screens": [{"n": number, "description": string}], "attach": [{"screen": number, "line": number, "why": "new" | "change" | "referenced" | "event"}]}
 
 summary: ${SUMMARY_LENGTHS[style.length]} on what the meeting was about and where it landed. Start with the substance, not "The meeting" or "In this call".
 decisions: what the people agreed or settled, one short sentence each, with the second it was settled. At most ${keeps(style).decisions}: the ones that matter most. An empty list if nothing was decided; something only suggested is not a decision.
@@ -294,9 +350,10 @@ Each transcript line starts with its number, as in "L12 [03:41] Name: words". li
 chapters: the parts of the meeting in order, two to six of them (one for a short meeting). at is the second the part starts, read from the transcript's [mm:ss] marks. title is two to five words; summary is one short sentence.
 suggestedQuestions: three short questions someone might ask about this meeting afterwards.
 
-A line starting "[mm:ss] [screen N" says what was on a shared screen from then on, as it was read: whose screen, how legible it was, its title, the words read on it, and its numbered parts. A screen that is partly legible, unreadable or not read shows only what its line says: never fill in what couldn't be read.
-screens: one entry for each screen N in the transcript, up to ${keeps(style).screens} of them (if there are more, the ones people talked about most), {"n": N, "description": string}: one or two plain sentences on what it shows and what was being said about it then. If it couldn't be read, or nothing said was about it, say only what can be told.
+A line starting "[mm:ss] [screen N" says what was on a shared screen from then on, as it was read: whose screen, how legible it was, "key" when what was said refers to it or relies on what it shows (otherwise it only gives context), how its picture compares with the share's screen before it ("first of this share", "changed a little since screen M", "changed a lot since screen M"), its title, the words read on it, and its numbered parts. A line "[mm:ss–mm:ss] [screens N–M same as screen K]" stands for screens whose picture stayed the same as screen K's then. A screen that is partly legible, unreadable or not read shows only what its line says: never fill in what couldn't be read.
+screens: one entry for each screen N given in full in the transcript, up to ${keeps(style).screens} of them (if there are more, the ones people talked about most), {"n": N, "description": string}: one or two plain sentences on what it shows and what was being said about it then. If it couldn't be read, or nothing said was about it, say only what can be told.
 screen: when a decision, question, action or chapter was about something on a screen, the N of that screen, with part: the number of the part meant, if one part is, and sure: true when what was said plainly refers to it ("this chart", "the numbers on the slide"), false when that only seems likely. Otherwise screen is null.
+attach: the screens shown beside the transcript, each on the line where it matters: screen is its N, line the number of that transcript line (12 for L12), and why says what happened. Attach a screen only when a new screen appears (new), what's shown changes in a way that matters (change), what was said refers to something on it (referenced), or something important happens on it (event). At most one screen per line. Never attach a screen that is the same as the last one attached for its share. An empty list if there are no screens.
 
 ${style.language === 'call' ? 'Write in the language the call was held in.' : `Write in ${LANGUAGE_NAMES[style.language]}.`} Use only what the transcript and its screens say: never invent names, numbers, dates or decisions. Lines without a name come from a recording in a room, where nobody can tell who spoke. A line starting "--" marks a stretch when notes were off or paused and nothing was recorded: never say or guess what happened in it. ${DOUBT} When the message lists what's already settled, those stand as the people in the meeting left them: never list them again, even in other words. ${SAID_ONLY}${ticked ? TICKED_RULE : ''}`;
 
@@ -326,8 +383,99 @@ const Draft = z.object({
   actions: z.array(z.object({ text: z.string(), owner: z.string().nullish().catch(null), due: z.string().nullish().catch(null), at: At, ...OnScreen, ...Backed, ticked: z.string().nullish() })),
   chapters: z.array(z.object({ at: z.coerce.number(), title: z.string(), summary: z.string().catch(''), ...OnScreen })).catch([]),
   suggestedQuestions: z.array(z.string()).catch([]),
-  screens: z.array(z.object({ n: z.coerce.number(), description: z.string().catch('') })).catch([])
+  screens: z.array(z.object({ n: z.coerce.number(), description: z.string().catch('') })).catch([]),
+  // Each checked on its own (AttachItem): one the model got wrong costs only itself.
+  attach: z.array(z.unknown()).catch([])
 });
+const AttachItem = z.object({ screen: z.coerce.number(), line: z.union([z.number(), z.string()]), why: z.enum(['new', 'change', 'referenced', 'event']).catch('change') });
+/** A line number the model gave: 12 or "L12". */
+const lineNo = (x: number | string): number => (typeof x === 'number' ? x : Number(/^\s*L?(\d+)\s*$/i.exec(x)?.[1] ?? Number.NaN));
+
+/** Why a screen is attached to a line: a new screen, a change that matters, what was said refers to it, or something important happened on it. */
+export type AttachWhy = z.infer<typeof AttachItem>['why'];
+/** A screen to attach, as the notes model asked: which (an index into the screens it was sent), on which transcript line (an index), and why. */
+export interface Attach { screen: number; line: number; why: AttachWhy }
+/** How far from its screen (seconds) the line it's attached to may be; one further off goes on the line being said then. */
+const ATTACH_NEAR_S = 30;
+/** Which of two screens on one line stays: a share's start, then a new screen, a change, a reference, an event (then the earlier). */
+const RANK: Record<AttachWhy | 'start', number> = { start: 0, new: 1, change: 2, referenced: 3, event: 4 };
+
+/**
+ * The screens shown beside the transcript, from the screens the notes model was sent (`shown`, in order) and the ones
+ * it asked to attach (`asked`, or null when the notes couldn't be written):
+ *
+ *  1. Each one asked for goes on the line it named, when that line exists and is within ATTACH_NEAR_S of the screen;
+ *     otherwise on the line being said at the screen (the last at or before it, or the first line).
+ *  2. Each share's first screen is always attached, on the line being said when the share began. Without the model's
+ *     list, so is each screen whose picture changed (a little or a lot) since its share's last one attached.
+ *  3. At most one screen a line: a share's start, then new, change, referenced, event, then the earliest.
+ *  4. A screen whose picture is the same as its share's last one attached is dropped (screenGrid.changeOf), and its
+ *     line goes to the next one asking for it, checked the same way.
+ *
+ * Each attached moment names its line, and lasts until its share's next attached one or the end of its segment.
+ */
+export function attachments(shown: ScreenMoment[], lines: TranscriptLine[], o: { grids?: ReadonlyMap<string, Uint8Array> | undefined; shares?: ScreenShare[] | undefined; asked: Attach[] | null }): ScreenMoment[] {
+  if (!lines.length) return [];
+  const grid = (i: number) => o.grids?.get(shown[i]?.id ?? '');
+  // The line being said at a second: the last one at or before it, or the first line when none is.
+  const lineAt = (t: number) => { let k = 0; lines.forEach((l, i) => { if (l.at <= t) k = i; }); return k; };
+  type Pick = { i: number; line: number; why: AttachWhy | 'start' };
+  const picks = new Map<number, Pick>();
+  const offer = (p: Pick) => { const was = picks.get(p.i); if (!was || RANK[p.why] < RANK[was.why]) picks.set(p.i, p); };
+  const began = new Map<string, Uint8Array | undefined>();
+  shown.forEach((m, i) => {
+    if (began.has(m.share)) {
+      // Without the model: what changed since the share's last screen attached.
+      if (o.asked || changeOf(began.get(m.share), grid(i)) === 'same') return;
+      began.set(m.share, grid(i));
+      offer({ i, line: lineAt(m.at), why: 'change' });
+      return;
+    }
+    began.set(m.share, grid(i));
+    offer({ i, line: lineAt(o.shares?.find((s) => s.id === m.share)?.at ?? m.at), why: 'start' });
+  });
+  for (const a of o.asked ?? []) {
+    const m = shown[a.screen];
+    if (!m) continue;
+    const said = lines[a.line];
+    offer({ i: a.screen, line: said && Math.abs(said.at - m.at) <= ATTACH_NEAR_S ? a.line : lineAt(m.at), why: a.why });
+  }
+  // The ones the same as their share's last one kept, in order.
+  const repeats = (xs: Pick[]): Set<number> => {
+    const last = new Map<string, Uint8Array | undefined>();
+    const out = new Set<number>();
+    for (const p of xs) {
+      const share = shown[p.i]?.share ?? '';
+      if (p.why !== 'start' && last.has(share) && changeOf(last.get(share), grid(p.i)) === 'same') { out.add(p.i); continue; }
+      last.set(share, grid(p.i));
+    }
+    return out;
+  };
+  const oneALine = (xs: Pick[]): Pick[] => {
+    const taken = new Set<number>();
+    const out: Pick[] = [];
+    for (const p of [...xs].sort((a, b) => RANK[a.why] - RANK[b.why] || a.i - b.i)) {
+      if (taken.has(p.line)) continue;
+      taken.add(p.line);
+      out.push(p);
+    }
+    return out.sort((a, b) => a.i - b.i);
+  };
+  // One a line, then repeats of what's kept dropped; a line a repeat held goes to the next strongest asking for it.
+  let pool = [...picks.values()];
+  let kept = oneALine(pool);
+  for (let again = repeats(kept); again.size; again = repeats(kept)) {
+    pool = pool.filter((p) => !again.has(p.i));
+    kept = oneALine(pool);
+  }
+  return kept.flatMap((p, k): ScreenMoment[] => {
+    const m = shown[p.i];
+    const l = lines[p.line];
+    if (!m || !l) return [];
+    const next = kept.slice(k + 1).map((q) => shown[q.i]).find((x) => x?.share === m.share && x.at > m.at && x.at < m.until);
+    return [{ ...m, until: next ? next.at : m.until, line: l.id }];
+  });
+}
 
 /**
  * Where something the model wrote was on a shared screen: one of the screens it was sent (numbered from 1), the part of
@@ -365,8 +513,11 @@ const NOBODY = new Set(['', 'unknown', 'unassigned', 'none', 'n/a', 'someone', '
 
 /** Writes a note's summary, decisions, open questions, follow-ups, chapters and suggested questions from its transcript, in the style asked for. */
 export async function draft(cfg: Config, b: Brief, style: NotesStyle): Promise<Written> {
-  const shown = b.screens ?? [];
-  const sent = numberedText(b.lines, b.gaps, shown);
+  // Only screens that matter to what was said, in order: one judged unrelated never reaches the notes. Each line is
+  // numbered, so the model can say which lines things come from and which line each screen it attaches goes on.
+  const shown = (b.screens ?? []).filter((m) => m.relevance !== 'unrelated').sort((x, y) => x.at - y.at || x.id.localeCompare(y.id));
+  const grids = b.grids ?? new Map<string, Uint8Array>();
+  const sent = numberedText(b.lines, b.gaps, shown, grids);
   const told = b.ticks ?? [];
   const { json, evidence } = await complete(cfg, [
     { role: 'system', content: notesPrompt(style, told.length > 0) },
@@ -378,6 +529,23 @@ export async function draft(cfg: Config, b: Brief, style: NotesStyle): Promise<W
   const reply = Draft.safeParse(json);
   if (!reply.success) throw new UnavailableError('The notes came back in the wrong shape.', { context: { what: 'notes', issues: issues(reply.error) } });
   const d = reply.data;
+  const asked = d.attach.flatMap((raw): Attach[] => {
+    const a = AttachItem.safeParse(raw);
+    const line = a.success ? lineNo(a.data.line) : Number.NaN;
+    return a.success && Number.isInteger(a.data.screen) && Number.isInteger(line) ? [{ screen: a.data.screen - 1, line: line - 1, why: a.data.why }] : [];
+  });
+  const attached = attachments(shown, b.lines, { grids, shares: b.shares, asked });
+  const nOf = new Map(shown.map((m, i) => [m.id, i + 1]));
+  // Something about a screen that isn't attached points at its share's attached screen before it, which shows the
+  // same thing; with none, at nothing.
+  const pointAt = (x: Parameters<typeof onScreen>[1]): { screen?: ScreenRef } => {
+    const ref = onScreen(shown, x).screen;
+    if (!ref) return {};
+    if (attached.some((m) => m.id === ref.id)) return { screen: ref };
+    const m = shown.find((s) => s.id === ref.id);
+    const before = m ? attached.filter((a) => a.share === m.share && a.at <= m.at).at(-1) : undefined;
+    return before ? { screen: { id: before.id, sure: ref.sure } } : {};
+  };
   const everyone = [b.organizer, ...b.people];
   const owner = (name: string | null | undefined): Speaker | undefined => {
     const n = name?.trim() ?? '';
@@ -391,7 +559,7 @@ export async function draft(cfg: Config, b: Brief, style: NotesStyle): Promise<W
   const last = Math.max(b.seconds, b.lines.at(-1)?.at ?? 0);
   const chapters = d.chapters
     .filter((c) => Number.isFinite(c.at) && c.title.trim())
-    .map((c): Chapter => ({ at: Math.round(Math.min(Math.max(0, c.at), last)), title: clip(c.title.trim(), 60), summary: clip(c.summary.trim(), 160), ...onScreen(shown, c) }))
+    .map((c): Chapter => ({ at: Math.round(Math.min(Math.max(0, c.at), last)), title: clip(c.title.trim(), 60), summary: clip(c.summary.trim(), 160), ...pointAt(c) }))
     .sort((a, b) => a.at - b.at)
     .filter((c, i, all) => i === 0 || c.at !== all[i - 1]?.at)
     .slice(0, 8);
@@ -414,9 +582,9 @@ export async function draft(cfg: Config, b: Brief, style: NotesStyle): Promise<W
   return {
     summary: clip(d.summary.trim(), 1500),
     // What the notes heard is only proposed: people who have the notes confirm it, or the organizer says it wasn't decided.
-    decisions: d.decisions.filter((x) => x.text.trim()).slice(0, keeps(style).decisions).map((x): Decision => ({ id: id128(), text: clip(x.text.trim(), 300), ...backed(x), state: 'proposed', ...onScreen(shown, x), disputes: [], changes: [] })),
+    decisions: d.decisions.filter((x) => x.text.trim()).slice(0, keeps(style).decisions).map((x): Decision => ({ id: id128(), text: clip(x.text.trim(), 300), ...backed(x), state: 'proposed', ...pointAt(x), disputes: [], changes: [] })),
     // Open until someone who has the notes says it was answered, here or in a later call.
-    questions: d.questions.filter((x) => x.text.trim()).slice(0, keeps(style).questions).map((x): Question => ({ id: id128(), text: clip(x.text.trim(), 300), ...backed(x), state: 'open', ...onScreen(shown, x), changes: [] })),
+    questions: d.questions.filter((x) => x.text.trim()).slice(0, keeps(style).questions).map((x): Question => ({ id: id128(), text: clip(x.text.trim(), 300), ...backed(x), state: 'open', ...pointAt(x), changes: [] })),
     // Only ever suggestions: whatever the model replies, nobody has taken these on, and only the person it's for can.
     actions: d.actions.filter((a) => a.text.trim()).slice(0, keeps(style).actions).map((a): ActionItem => {
       const who = owner(a.owner);
@@ -424,13 +592,14 @@ export async function draft(cfg: Config, b: Brief, style: NotesStyle): Promise<W
       const id = id128();
       const tick = a.ticked ? tickOf(a.ticked) : undefined;
       if (tick) ticks.set(id, tick);
-      return { id, text: clip(a.text.trim(), 300), ...(who ? { owner: who } : {}), takenOn: false, ...(due ? { due: clip(due, 40) } : {}), ...backed(a), done: false, ...onScreen(shown, a), changes: [] };
+      return { id, text: clip(a.text.trim(), 300), ...(who ? { owner: who } : {}), takenOn: false, ...(due ? { due: clip(due, 40) } : {}), ...backed(a), done: false, ...pointAt(a), changes: [] };
     }),
     ticks,
     chapters,
     suggestedQuestions: d.suggestedQuestions.map((q) => clip(q.trim(), 120)).filter(Boolean).slice(0, 3),
-    // Each screen with what the model said it shows and how it ties in; one it said nothing about keeps its reading alone.
-    screens: shown.map((m, i) => ({ ...m, description: clip(d.screens.find((x) => x.n === i + 1)?.description.trim() ?? '', 400) })),
+    // The screens attached, each with what the model said it shows and how it ties in; one it said nothing about keeps
+    // its reading alone. The rest only went into what the notes say.
+    screens: attached.map((m) => ({ ...m, description: clip(d.screens.find((x) => x.n === nOf.get(m.id))?.description.trim() ?? '', 400) })),
     evidence
   };
 }
@@ -871,33 +1040,205 @@ export async function translate(cfg: Config, lines: { id: string; text: string }
   return new Map(reply.data.lines.filter((l) => wanted.has(l.id) && l.text.trim()).map((l) => [l.id, clip(l.text.trim(), 1000)]));
 }
 
-const READ_SCREEN_PROMPT = `You read one frame of a screen someone shared in a meeting. Reply with a single JSON object and nothing else, in this shape:
-{"title": string, "text": string, "legible": "clear" | "partly" | "unreadable", "regions": [{"label": string, "box": [number, number, number, number]}]}
+/* ---------- shared screens: which moments to look at, and what's on them ---------- */
+
+/** Why what was said points at a screen: it refers to what's shown, the screen changed, a question about it, or a new topic while it's shared. */
+export const MOMENT_WHY = ['reference', 'change', 'question', 'topic'] as const;
+export type MomentWhy = (typeof MOMENT_WHY)[number];
+/** A moment the notes model picked from the transcript: a second of the recording, the share it names (from 1), the words that point at it, and why. */
+export interface Moment { at: number; share: number; cue: string; why: MomentWhy }
+
+/** Lines this close to a share (seconds) are read for its moments: people often point at a screen just before or after it's up. */
+const NEAR_SHARE_S = 15;
+/** How much transcript goes in one request for moments; a longer one goes in several, each with the shares it overlaps. */
+const PICK_CHARS = 60_000;
+
+const PICK_PROMPT = `You pick the moments of a meeting when what was said points at a shared screen, so a frame of that screen can be looked at then. Reply with a single JSON object and nothing else, in this shape:
+{"moments": [{"at": number, "share": number, "cue": string, "why": "reference" | "change" | "question" | "topic"}]}
+
+The message lists the shares, each numbered, with whose screen it was and when it was up, from [mm:ss] to [mm:ss]. Each transcript line starts with its [mm:ss].
+Pick a moment only when what was said points at what's on a screen. reference: it refers to what's shown ("as you can see", "here", "this slide", "this chart", "scroll down", "look at the numbers"), or someone reads out words or numbers that are on the screen. change: someone says the screen changes or moves on ("now that this is complete", "next slide", "let me switch to the demo"). question: a question about what's shown ("what do you think of these changes?"). topic: the talk turns to a new topic while a screen is shared.
+at: the second it was said, in seconds from the start, read from the [mm:ss] marks (01:05 is 65). share: the number of the share that was up then. cue: the words said that point at it, as they were said, at most 120 characters. why: reference, change, question or topic.
+Pace: about one moment every ten seconds of sharing. Go up to one a second only while the screen is very busy, as when a live demo is stepped through and each step is talked over; otherwise keep well below that. Never two in the same second. Only seconds inside a share's time, in order. An empty list if nothing said points at a screen. ${DOUBT} ${SAID_ONLY}`;
+
+/** A second the model gave: a number of seconds, or "mm:ss". */
+const secondsOf = (v: unknown): number | null => {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v !== 'string') return null;
+  const mm = /^\s*(\d+):(\d{1,2})\s*$/.exec(v);
+  if (mm) return Number(mm[1]) * 60 + Number(mm[2]);
+  const n = Number(v);
+  return v.trim() && Number.isFinite(n) ? n : null;
+};
+const MomentsReply = z.object({ moments: z.array(z.unknown()).catch([]) });
+const MomentItem = z.object({ at: z.unknown(), share: z.coerce.number().catch(0), cue: z.string().catch(''), why: z.enum(MOMENT_WHY).catch('reference') });
+
+/**
+ * The moments of a call when what was said points at a shared screen, picked by the notes model from the transcript
+ * and the shares (numbered from 1 in the order given). Only lines near a share are read; a long call goes in several
+ * requests. A moment the model gave that makes no sense is dropped, and a reply that isn't moments at all counts as
+ * none (`unusable` says how many were), so a bad answer costs only the cues, never the notes.
+ */
+export async function pickMoments(cfg: Config, lines: TranscriptLine[], shares: ScreenShare[]): Promise<{ moments: Moment[]; evidence: InferenceEvidence[]; requests: number; unusable: number }> {
+  const said = lines.filter((l) => shares.some((sh) => l.at >= sh.at - NEAR_SHARE_S && l.at <= sh.until + NEAR_SHARE_S)).map((l) => ({ at: l.at, text: spoken(l) }));
+  const chunks: { at: number; text: string }[][] = [];
+  let size = 0;
+  for (const x of said) {
+    const last = chunks.at(-1);
+    if (!last || size + x.text.length + 1 > PICK_CHARS) { chunks.push([x]); size = x.text.length + 1; } else { last.push(x); size += x.text.length + 1; }
+  }
+  const moments: Moment[] = [];
+  const evidence: InferenceEvidence[] = [];
+  let unusable = 0;
+  for (const chunk of chunks) {
+    const from = chunk[0]?.at ?? 0;
+    const to = chunk.at(-1)?.at ?? 0;
+    const listed = shares.flatMap((sh, i) => (sh.at <= to + NEAR_SHARE_S && sh.until >= from - NEAR_SHARE_S ? [`Share ${i + 1}: ${oneLine(sh.label)}, from [${mmss(sh.at)}] to [${mmss(sh.until)}]`] : []));
+    const { json, evidence: e } = await complete(cfg, [
+      { role: 'system', content: PICK_PROMPT },
+      { role: 'user', content: `Shares:\n${listed.join('\n')}\n\nTranscript:\n${fenced(chunk.map((x) => x.text).join('\n'))}` }
+    ], { what: 'pick-moments', maxTokens: 6000, timeoutMs: 180_000 });
+    evidence.push(e);
+    const reply = MomentsReply.safeParse(json);
+    if (!reply.success) { unusable++; continue; }
+    for (const raw of reply.data.moments) {
+      const m = MomentItem.safeParse(raw);
+      const at = m.success ? secondsOf(m.data.at) : null;
+      if (!m.success || at === null || at < 0 || !Number.isInteger(m.data.share)) continue;
+      moments.push({ at, share: m.data.share, cue: clip(oneLine(m.data.cue), 120), why: m.data.why });
+    }
+  }
+  return { moments, evidence, requests: chunks.length, unusable };
+}
+
+/** Why a frame was taken: a moment's reason, the share's first second, or to fill a stretch nothing said pointed at (and the share's end). */
+export const PICK_WHY = [...MOMENT_WHY, 'start', 'fill'] as const;
+export type PickWhy = (typeof PICK_WHY)[number];
+/** A frame to take: of which share, in which segment of the recording, at which tenth of a second of the recording, and why. */
+export interface FramePick { share: string; segment: number; at: number; cue: string; why: PickWhy }
+
+/** What's pointed at plainly comes first when there are more moments than frames. */
+const FIRST: Record<MomentWhy, number> = { reference: 0, question: 0, change: 1, topic: 1 };
+/** No stretch of a share goes longer than this (seconds) without a frame. */
+const FILL_GAP_S = 10;
+/** Frames are taken on a grid of tenths of a second (ffmpeg.frames). */
+const tenth = (x: number) => Math.round(x * 10) / 10;
+
+/** `n` of `xs` (in order), spread evenly from the first to the last. */
+function spread<T>(xs: T[], n: number): T[] {
+  if (n >= xs.length) return xs;
+  if (n <= 0) return [];
+  if (n === 1) return xs.slice(Math.floor(xs.length / 2), Math.floor(xs.length / 2) + 1);
+  return Array.from({ length: n }, (_, i) => xs[Math.round((i * (xs.length - 1)) / (n - 1))]).flatMap((x) => (x === undefined ? [] : [x]));
+}
+
+/**
+ * The frames to take, at most `max`, for each share's video in each segment (from its first whole second to half a
+ * second short of its end, where the last frame may be missing):
+ *
+ *  - Each moment picked from what was said, inside a share's video. A moment naming no share up then goes to the share
+ *    that was (the one that started last, as replay shows it), and one outside every share is dropped. At most one a
+ *    second for each share: the one pointed at most plainly, or the first.
+ *  - The segment's first second (`start`) and its end.
+ *  - Between any two of those more than FILL_GAP_S apart, frames spread evenly (`fill`), so no stretch goes longer
+ *    without one.
+ *
+ * Over `max`: the moments first (what's pointed at plainly first, spread evenly over the call), then starts and ends,
+ * then fills, each spread evenly. The same moments always give the same frames, so a retried job takes the same ones.
+ */
+export function selectFrames(moments: Moment[], shares: ScreenShare[], max = MAX_SCREEN_FRAMES): FramePick[] {
+  const spans = shares.flatMap((sh) => sh.segments.map((g) => ({ share: sh.id, started: sh.at, segment: g.segment, lo: Math.ceil(g.at), hi: tenth(g.until - 0.5) })))
+    .filter((x) => x.hi >= x.lo)
+    .sort((a, b) => b.started - a.started);
+  const inside = (share: string | undefined, s: number) => spans.find((x) => (share === undefined || x.share === share) && s >= x.lo && s <= x.hi);
+  const found = new Map<string, FramePick & { why: MomentWhy }>();
+  for (const m of moments) {
+    const named = shares[m.share - 1]?.id;
+    let place: { span: (typeof spans)[number]; s: number } | undefined;
+    for (const s of [tenth(m.at), Math.floor(m.at), Math.ceil(m.at)]) {
+      const span = (named ? inside(named, s) : undefined) ?? inside(undefined, s);
+      if (span) { place = { span, s }; break; }
+    }
+    if (!place) continue;
+    const key = `${place.span.share}:${Math.floor(place.s)}`;
+    const was = found.get(key);
+    if (was && FIRST[was.why] <= FIRST[m.why]) continue;
+    found.set(key, { share: place.span.share, segment: place.span.segment, at: place.s, cue: m.cue || was?.cue || '', why: m.why });
+  }
+  const byTime = (a: FramePick, b: FramePick) => a.at - b.at || a.share.localeCompare(b.share);
+  const all = [...found.values()].sort(byTime);
+  const plain = all.filter((p) => p.why === 'reference' || p.why === 'question');
+  const rest = all.filter((p) => !(p.why === 'reference' || p.why === 'question'));
+  const picks: FramePick[] = plain.length >= max ? spread(plain, max) : [...plain, ...spread(rest, max - plain.length)];
+
+  const edges: FramePick[] = [];
+  const fills: FramePick[] = [];
+  for (const span of [...spans].sort((x, y) => x.lo - y.lo || x.share.localeCompare(y.share))) {
+    const frame = (at: number, why: PickWhy): FramePick => ({ share: span.share, segment: span.segment, at, cue: '', why });
+    const mine = picks.filter((p) => p.share === span.share && p.segment === span.segment).map((p) => p.at);
+    if (!mine.includes(span.lo)) edges.push(frame(span.lo, 'start'));
+    if (span.hi > span.lo && !mine.includes(span.hi)) edges.push(frame(span.hi, 'fill'));
+    const anchors = [...new Set([span.lo, ...mine, span.hi])].sort((x, y) => x - y);
+    for (let i = 1; i < anchors.length; i++) {
+      const a = anchors[i - 1] ?? 0;
+      const gap = (anchors[i] ?? 0) - a;
+      const n = Math.ceil(gap / FILL_GAP_S) - 1;
+      for (let k = 1; k <= n; k++) fills.push(frame(tenth(a + (gap * k) / (n + 1)), 'fill'));
+    }
+  }
+  const room = Math.max(0, max - picks.length);
+  const ends = spread(edges.sort(byTime), room);
+  return [...picks, ...ends, ...spread(fills.sort(byTime), room - ends.length)].sort(byTime);
+}
+
+const READ_SCREEN_PROMPT = `You read one frame of a screen someone shared in a meeting, and judge whether it matters to what was being said then. Reply with a single JSON object and nothing else, in this shape:
+{"title": string, "text": string, "legible": "clear" | "partly" | "unreadable", "regions": [{"label": string, "box": [number, number, number, number]}], "relevance": "key" | "supporting" | "unrelated", "why": string}
 
 title: what it is, in a few words: a slide's heading, a document's or page's name, or the app and what's open in it.
 text: the words and numbers you can read on it, exactly as written, top to bottom, one line each, at most 600 characters. Leave out what you can't read; never guess at it or fill it in.
 legible: clear if you can read all of it, partly if some of it is too small, blurred or cut off, unreadable if you can't make it out at all.
 regions: up to four parts someone might point at while talking, such as a chart, a table, a code block or a paragraph, each with a short label and its box as [left, top, right, bottom], each a fraction of the frame's width or height from 0 to 1. An empty list if nothing stands out.
-Describe only what is on the frame. Write in the language on the screen.`;
+relevance: what's on a shared screen is often unrelated to what's being said: a desktop, an email, a different tab, a loading screen, or the meeting app itself. key only when what was said refers to what's shown, or the frame holds facts the discussion relies on. supporting when it gives useful context for what was said. Otherwise unrelated. Judge it by what was said as well as by the frame: never call a frame relevant from the image alone when what was said contradicts it.
+why: one short sentence on why, at most 160 characters.
+Describe only what is on the frame. Write in the language on the screen. ${SAID_ONLY}`;
 
 const ScreenReply = z.object({
   title: z.string().catch(''), text: z.string().catch(''),
   // Saying nothing about how legible it was isn't saying it was clear.
   legible: z.enum(['clear', 'partly', 'unreadable']).catch('partly'),
-  regions: z.array(z.object({ label: z.string(), box: z.array(z.coerce.number()).length(4) })).catch([])
+  regions: z.array(z.object({ label: z.string(), box: z.array(z.coerce.number()).length(4) })).catch([]),
+  relevance: z.enum(['key', 'supporting', 'unrelated']).nullish().catch(null)
 });
 const unit = (n: number) => Math.min(1, Math.max(0, n));
 
+/** What was said around a frame, for judging it: when it was taken, the words that picked it and why, and the lines within 30 seconds. */
+export interface ScreenContext { at: number; cue: string; why: PickWhy; lines: TranscriptLine[] }
+/** How far from a frame the lines sent with it are, and at most how much of them. */
+const AROUND_S = 30;
+const AROUND_CHARS = 6000;
 /**
- * What's on one frame of a shared screen, read by the notes model: the image goes sealed to its verified key, like
- * every request. Only what it could read is kept, with how legible it was; the parts it points at are boxes inside
- * the frame, as fractions of it, and at least a sliver big.
+ * How much a frame matters when the model read it but didn't say: one picked because what was said plainly pointed at
+ * it, and that could be made out, gives context; anything else (a share's start, a fill, a change or a new topic, or a
+ * frame it found unreadable) is left out. A frame read with nothing said to go by (notes written before frames were picked) keeps what
+ * old notes show. A frame that couldn't be read at all isn't judged here: it's kept as unread (screens.readOne).
  */
-export async function readScreen(cfg: Config, jpeg: Uint8Array): Promise<Reading> {
-  const { json } = await complete(cfg, [
+const unsaid = (c: ScreenContext | undefined, legible: Reading['legible']): ScreenRelevance =>
+  !c ? 'supporting' : legible !== 'unreadable' && (c.why === 'reference' || c.why === 'question') ? 'supporting' : 'unrelated';
+
+/**
+ * What's on one frame of a shared screen, and how much it matters to what was said around it, read by the vision model
+ * (`via`, the notes model unless said): the image and what was said go sealed to its verified key, like every request.
+ * Only what it could read is kept, with how legible it was; the parts it points at are boxes inside the frame, as
+ * fractions of it, and at least a sliver big. Its reasons aren't kept.
+ */
+export async function readScreen(cfg: Config, jpeg: Uint8Array, o: { context?: ScreenContext | undefined; via?: ChatModel | undefined } = {}): Promise<{ reading: Reading; relevance: ScreenRelevance; evidence: InferenceEvidence }> {
+  const c = o.context;
+  const around = c ? clip(c.lines.filter((l) => Math.abs(l.at - c.at) <= AROUND_S).map(spoken).join('\n'), AROUND_CHARS) : '';
+  const said = c ? `The frame was taken at [${mmss(c.at)}], ${c.cue ? 'picked for what was said then (the cue below)' : c.why === 'start' ? 'taken as the share began' : c.why === 'fill' ? 'taken to fill a stretch of the share that nothing said pointed at' : 'picked because the talk moved on then'}. What was said within ${AROUND_S} seconds of it:\n${fenced([...(c.cue ? [`Cue: ${oneLine(c.cue)}`] : []), around || '(nothing was said)'].join('\n'))}\n\n` : '';
+  const { json, evidence } = await complete(cfg, [
     { role: 'system', content: READ_SCREEN_PROMPT },
-    { role: 'user', content: [{ type: 'text', text: 'The frame:' }, jpegPart(jpeg)] }
-  ], { what: 'read-screen', maxTokens: 1200, timeoutMs: 60_000 });
+    { role: 'user', content: [{ type: 'text', text: `${said}The frame:` }, jpegPart(jpeg)] }
+  ], { what: 'read-screen', maxTokens: 1200, timeoutMs: 60_000, via: o.via });
   const reply = ScreenReply.safeParse(json);
   if (!reply.success) throw new UnavailableError('The screen came back read in the wrong shape.', { context: { what: 'read-screen', issues: issues(reply.error) } });
   const r = reply.data;
@@ -906,5 +1247,8 @@ export async function readScreen(cfg: Config, jpeg: Uint8Array): Promise<Reading
     const label = clip(g.label.trim(), 60);
     return label && rt - l >= 0.02 && b - t >= 0.02 ? [{ label, x: l, y: t, w: Math.round((rt - l) * 1000) / 1000, h: Math.round((b - t) * 1000) / 1000 }] : [];
   }).slice(0, 4);
-  return { legible: r.legible, title: clip(r.title.trim(), 120), text: clip(r.text.trim(), SCREEN_TEXT_CHARS), regions };
+  return {
+    reading: { legible: r.legible, title: clip(r.title.trim(), 120), text: clip(r.text.trim(), SCREEN_TEXT_CHARS), regions },
+    relevance: r.relevance ?? unsaid(c, r.legible), evidence
+  };
 }

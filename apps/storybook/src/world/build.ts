@@ -6,7 +6,7 @@
 import {
   DEFAULT_NOTES_CHOICES, type ActionItem, type Calendar, type CalendarEvent, type Change, type Changer, type Chapter, type InferenceEvidence, type Meeting,
   type Note, type NoteAction, type NoteDecision, type NoteEvidence, type NoteFound, type NoteKind, type NoteQuestion, type NoteStatus, type NoteSummary,
-  type NotesSetting, type Person, type Received, type Recipient, type RecipientRole, type Repeat, type RsvpCounts, type ScreenMoment, type TranscriptLine
+  type NotesSetting, type Person, type Received, type Recipient, type RecipientRole, type Repeat, type RsvpCounts, type ScreenMoment, type ScreenShare, type TranscriptLine
 } from '@alcove/api';
 import { ART } from './people';
 
@@ -48,6 +48,8 @@ export interface NoteSpec {
   questions?: readonly QuestionSpec[] | undefined;
   actions?: readonly ActionSpec[] | undefined;
   screens?: readonly ScreenMoment[] | undefined;
+  /** Shares kept for the notes, which the note's replay plays in step with the audio. */
+  shares?: readonly ScreenShare[] | undefined;
   meetingId?: string | undefined;
   seriesId?: string | undefined;
   /** What the call kept: the transcript and the recording, unless it says otherwise. */
@@ -146,6 +148,8 @@ export function writeNote(s: NoteSpec, me: Person = ART): Note {
     chapters: status === 'ready' ? (s.chapters ?? []).map(([at, title, summary]): Chapter => ({ at: mmss(at), title, summary })) : [],
     gaps: [],
     screens: status === 'ready' ? [...(s.screens ?? [])] : [],
+    shares: status === 'ready' ? [...(s.shares ?? [])] : [],
+    screenModel: null,
     transcript: status === 'recording' ? null : kept.transcript || status !== 'ready' ? transcript : [],
     rooms: [],
     additions: [],

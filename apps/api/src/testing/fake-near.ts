@@ -11,9 +11,13 @@
  *
  * Speech is "recognised" from a marker a test writes into the WAV samples (see `speechWav`), so a test
  * decides exactly what was said and in which language; a clip without one is heard the way Whisper hears
- * silence. Each transcription's language and prompt are kept, so tests can see what a clip was sent with. A
- * shared screen is "read" the same way, from a marker in its JPEG's comment segment (see `screenJpeg`); a frame
- * without one can't be made out. The notes model writes from the transcript it was sent, screens included, so
+ * silence. Each transcription's language and prompt are kept, so tests can see what a clip was sent with. The
+ * catalog (/v1/models) lists the notes model, a second model that takes images (`VISION_MODEL`, attested on its own
+ * machine and served at its own endpoint, a second port the registry of endpoints names), one that's listed the
+ * same way but whose evidence never checks out (`UNVERIFIED_VISION_MODEL`), and models that can't be offered. Moments to look at a shared screen are picked from cues in the transcript (see `notesReply`); a frame is
+ * "read" as the moment it was taken and the model that read it, and judged by its cue: one with "UNRELATED" in it is
+ * unrelated, any other cue key, and a frame taken at a share's start or to fill a stretch supporting. The notes attach each screen given in full to the
+ * line said at or before it, unless a test gives the list (`attachNext`). The notes model writes from the transcript it was sent, screens included, so
  * tests can see the transcript arrived intact and the reply was checked before use; asked across notes, it
  * answers from the lines of each note it was sent and cites them by note, plus a note it wasn't sent, as a model
  * can make one up; and asked to compare a call with earlier ones in its series, it reads "instead" in a decision and
@@ -33,6 +37,10 @@ import { fakeIntel, fakeNvidia, type Answer, type FakeIntel, type FakeNvidia } f
 
 const STT_MODEL = 'openai/whisper-large-v3';
 const NOTES_MODEL = 'z-ai/glm-5.3-flash';
+/** The other model in the catalog that reads images, which an organizer can choose to read shared screens. */
+export const VISION_MODEL = 'qwen/qwen3-vl-test';
+/** A model the catalog lists as reading images, with its own endpoint, whose evidence never checks out: NEAR AI sends no report for it. */
+export const UNVERIFIED_VISION_MODEL = 'acme/vision-unverified';
 
 /**
  * What the evidence (or the models' endpoints) can be made to get wrong. On the gateway's report or a
@@ -49,14 +57,15 @@ export type Tamper =
   | 'expired' | 'tcb' | 'pcs-down' | 'unnamed-platform'
   | 'nvidia-root' | 'nvidia-expired' | 'nvidia-not-ca' | 'nras-down' | 'jwks-down'
   | 'report-down' | 'refuse' | 'reply-sealed';
-export type Task = 'transcript' | 'notes';
+/** The attested machines: the speech model, the notes model and the second vision model. */
+export type Task = 'transcript' | 'notes' | 'vision';
 /** How a reply can fail: the service down, prose instead of JSON, empty notes, or a reply that ran out of tokens part way. */
 export type Failure = 'down' | 'prose' | 'stub' | 'cut-off' | 'empty' | 'partial' | 'lines';
 
 export interface FakeNear {
   /** What the API is configured with to use this NEAR AI, and the stand-in Intel and NVIDIA that vouch for it. */
   settings: {
-    NEAR_AI_BASE_URL: string; NEAR_AI_API_KEY: string; NEAR_AI_STT_URL: string; NEAR_AI_NOTES_URL: string;
+    NEAR_AI_BASE_URL: string; NEAR_AI_API_KEY: string; NEAR_AI_STT_URL: string; NEAR_AI_NOTES_URL: string; NEAR_AI_ENDPOINTS_URL: string;
     INTEL_PCS_URL: string; INTEL_ROOT_CA: string; NVIDIA_NRAS_URL: string; NVIDIA_ROOT_CA: string;
   };
   /**
@@ -70,8 +79,8 @@ export interface FakeNear {
   prompts: string[];
   /** The system messages the notes model was sent, in the same order as `prompts`. */
   instructions: string[];
-  /** Every image the notes model was sent, once opened: its size, what a test put on it (null for nothing legible) and the salt that tells it apart. */
-  images: { bytes: number; marker: string | null; salt: string }[];
+  /** Every chat request, once opened, oldest first: the model it named, the attested key it was sealed to, its system message, and how many images it carried. */
+  chats: { model: string; key: string | null; system: string; images: number }[];
   /** What each clip was transcribed with besides its audio, once opened, oldest first: the language it named and its prompt, or null. */
   transcriptions: { language: string | null; prompt: string | null }[];
   /** The models' attested signing keys right now, hex. */
@@ -88,9 +97,12 @@ export interface FakeNear {
    * The next `n` chat replies fail: the service is down, the model answers in prose instead of JSON, with the shape and
    * nothing in it, with an empty object, with an object that has a summary and nothing else that's any use, with every
    * point's lines in the wrong shape, or runs out of tokens part way. With `only`, just the requests with that in their
-   * prompt fail, and count: one part of a note goes wrong while the rest is written.
+   * prompt fail, and count: one part of a note goes wrong while the rest is written. `only` 'notes' means the notes' own
+   * request, whatever it holds, so what reads a screen goes on working.
    */
   failNext(n: number, how: Failure, only?: string | undefined): void;
+  /** The next notes written attach these screens (each as the model would give it, right or wrong) instead of their own choice. */
+  attachNext(attach: unknown[]): void;
   /** The next chat reply takes this long, as a busy model does. */
   slowNext(ms: number, only?: string | undefined): void;
   /** The next request to the notes model waits for this before it's answered, as if something happened while the model wrote. */
@@ -129,46 +141,6 @@ export function speechWav(words: string, ms = 4000, language = 'en', sure = true
   const out = new Uint8Array(new ArrayBuffer(44 + data.length));
   out.set(head); out.set(data, 44);
   return out;
-}
-
-/** What a test puts on a shared screen: its title, the lines on it, how legible it is, and the parts worth pointing at ([left, top, right, bottom]). */
-export interface ScreenShown { title: string; lines: string[]; legible?: 'clear' | 'partly' | 'unreadable'; regions?: { label: string; box: [number, number, number, number] }[] }
-/**
- * A frame of a shared screen for the fake: a JPEG's header (start, a comment carrying what's on the screen, the frame
- * header with its size, end), which is all the server reads of one. Without `shown`, nothing on it can be made out.
- */
-export function screenJpeg(shown: ScreenShown | null, width = 1280, height = 720, salt = ''): Uint8Array<ArrayBuffer> {
-  const seg = (marker: number, payload: Buffer) => Buffer.concat([Buffer.from([0xff, marker, (payload.length + 2) >> 8, (payload.length + 2) & 255]), payload]);
-  const comment = seg(0xfe, Buffer.from(`${shown ? `SCREEN:${JSON.stringify(shown)}` : 'NOISE'}|${salt}`, 'utf8'));
-  const sof = seg(0xc0, Buffer.from([8, height >> 8, height & 255, width >> 8, width & 255, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]));
-  const all = Buffer.concat([Buffer.from([0xff, 0xd8]), comment, sof, Buffer.from([0xff, 0xd9])]);
-  const out = new Uint8Array(new ArrayBuffer(all.length));
-  out.set(all);
-  return out;
-}
-/** A JPEG's comment segment, as text. */
-function commentOf(jpeg: Buffer): string {
-  for (let i = 2; i + 4 <= jpeg.length && jpeg[i] === 0xff;) {
-    const length = jpeg.readUInt16BE(i + 2);
-    if (jpeg[i + 1] === 0xfe) return jpeg.subarray(i + 4, i + 2 + length).toString('utf8');
-    i += 2 + length;
-  }
-  return '';
-}
-/** What's on a frame, from its comment, or null when nothing can be made out. */
-function shownIn(jpeg: Buffer): ScreenShown | null {
-  const m = /^SCREEN:(\{.*\})\|/s.exec(commentOf(jpeg));
-  if (!m) return null;
-  const v: unknown = JSON.parse(m[1] ?? '{}');
-  if (typeof v !== 'object' || v === null || !('title' in v) || !('lines' in v)) return null;
-  const lines = Array.isArray(v.lines) ? v.lines.map((l: unknown) => str(l)) : [];
-  const legible = 'legible' in v && (v.legible === 'partly' || v.legible === 'unreadable') ? v.legible : 'clear';
-  const regions = 'regions' in v && Array.isArray(v.regions) ? v.regions.flatMap((r: unknown) => {
-    if (typeof r !== 'object' || r === null || !('label' in r) || !('box' in r) || !Array.isArray(r.box)) return [];
-    const [a = 0, b = 0, c = 0, d = 0] = r.box.map((x: unknown) => (typeof x === 'number' ? x : 0));
-    return [{ label: str(r.label), box: [a, b, c, d] satisfies [number, number, number, number] }];
-  }) : [];
-  return { title: str(v.title), lines, legible, regions };
 }
 
 const hex = (b: Uint8Array) => Buffer.from(b).toString('hex');
@@ -221,7 +193,7 @@ async function transcription(contentType: string, body: Uint8Array, calls: FakeN
   return { status: 200, body: { text: said.map((x) => x.text).join(''), duration: String(seconds), language: asked.language ?? speech?.language ?? 'en', segments, id: `trans-${randomUUID()}` } };
 }
 
-interface Shown { n: number; at: number; title: string; parts: number }
+interface Shown { n: number; at: number; title: string; parts: number; hint: 'first' | 'changed' | null }
 /**
  * A line of what was said, the shared screen up when it was (the last one above it in the transcript), and its number
  * when the lines are numbered ("L12 [mm:ss] …"; 0 when they aren't).
@@ -231,15 +203,19 @@ interface Heard { at: number; who: string; text: string; screen: Shown | undefin
 function screensIn(prompt: string): Shown[] {
   return prompt.split('\n').flatMap((l) => {
     const m = /^\[(\d+):(\d\d)\] \[screen (\d+)[^\]]*\] (.*?)\.(?: Reads:| Parts:|$)/.exec(l);
-    return m ? [{ at: Number(m[1]) * 60 + Number(m[2]), n: Number(m[3]), title: m[4] ?? '', parts: (l.match(/ \(\d+\) /g) ?? []).length }] : [];
+    const hint = / first of this share\]/.test(l) ? 'first' : / changed a (?:little|lot) since screen \d+\]/.test(l) ? 'changed' : null;
+    return m ? [{ at: Number(m[1]) * 60 + Number(m[2]), n: Number(m[3]), title: m[4] ?? '', parts: (l.match(/ \(\d+\) /g) ?? []).length, hint }] : [];
   });
 }
+/** A line that stands for screens the same as one before: "[mm:ss–mm:ss] [screens 4–9 same as screen 3]". */
+const SAME_SCREENS = /^\[[\d:–]+\] \[screens? [\d–, ]+ same as screen \d+\]$/;
 /** Reads back "[mm:ss] Name: words" lines from a prompt, numbered or not, each with the screen above it, as a reader takes them in. */
 function heardIn(prompt: string): Heard[] {
   let screen: Shown | undefined;
   return prompt.split('\n').flatMap((l) => {
     const shown = screensIn(l)[0];
     if (shown) { screen = shown; return []; }
+    if (SAME_SCREENS.test(l)) return [];
     const m = /^(?:L(\d+) )?\[(\d+):(\d\d)\] (?:([^:]+): )?(.*)$/.exec(l);
     return m ? [{ ref: Number(m[1] ?? 0), at: Number(m[2]) * 60 + Number(m[3]), who: m[4] ?? '', text: m[5] ?? '', screen }] : [];
   });
@@ -261,7 +237,6 @@ function notesIn(prompt: string): { n: number; heard: Heard[] }[] {
 /** The words of a question worth looking for in what was said. */
 const wordsAsked = (user: string) => (/\nQuestion: (.*)$/s.exec(user)?.[1] ?? '').toLowerCase().split(/\W+/).filter((w) => w.length > 3);
 
-/** What the notes model writes for a system prompt, a user message and the images sent with it. */
 /** What's listed in a prompt with a label, as "F2 (Kofi) Send the deck". */
 const labelledIn = (prompt: string, letter: string): { label: string; text: string }[] => prompt.split('\n').flatMap((l) => {
   const m = new RegExp(`^(${letter}\\d+) (?:\\([^)]*\\) )?(.*)$`).exec(l);
@@ -271,7 +246,16 @@ const labelledIn = (prompt: string, letter: string): { label: string; text: stri
 /** What the stand-in remembers between requests: how to word what it hears, every way it has worded it, and what it's been told to say each one is. */
 interface Memory { reworded: Map<string, string>; worded: Map<string, Set<string>>; identified: Map<string, string> }
 
-function notesReply(system: string, user: string, images: Buffer[], memory: Memory): unknown {
+/**
+ * What's said that points at a screen once, what has it moving on for twenty seconds ("as I scroll through all of this"),
+ * and what has it stepping on three times in one second ("step by step"), more than Alcove takes.
+ */
+const CUE = /as you can see|what do you think|this slide|this chart|UNRELATED/i;
+const SCROLLING = /scroll through/i;
+const STEPPING = /step by step/i;
+
+/** What a chat model writes for a system prompt, a user message and the images sent with it; `attach`, the notes' screens to attach when a test gave them. */
+function notesReply(model: string, system: string, user: string, images: Buffer[], memory: Memory, attach: unknown[] | null): unknown {
   const { reworded, worded, identified } = memory;
   /** How it words what it hears, remembered, as a model reads its own words back. */
   const remembered = (line: string, text: string) => { if (text) worded.set(line, (worded.get(line) ?? new Set()).add(text)); return text; };
@@ -284,12 +268,28 @@ function notesReply(system: string, user: string, images: Buffer[], memory: Memo
     return listed.find((k) => k.text === of || worded.get(of)?.has(k.text))?.label ?? null;
   };
   if (system.startsWith('You read one frame')) {
-    // Reads what a test wrote on the frame, exactly; a frame without it can't be made out.
-    const shown = images[0] ? shownIn(images[0]) : null;
-    if (!shown) return { title: '', text: '', legible: 'unreadable', regions: [] };
-    return { title: shown.title, text: shown.lines.join('\n'), legible: shown.legible ?? 'clear', regions: shown.regions ?? [] };
+    // A frame can't be made out here: it's "read" as when it was taken and by whom, and judged by its cue.
+    const taken = /taken at \[(\d+:\d\d)\]/.exec(user)?.[1];
+    if (!images[0]?.length || !taken) return { title: '', text: '', legible: 'unreadable', regions: [], relevance: 'unrelated', why: 'Nothing to go by.' };
+    const cue = /^Cue: (.*)$/m.exec(user)?.[1] ?? '';
+    return {
+      title: `Frame at ${taken}`, text: `Shown at ${taken}\nRead by ${model}`, legible: 'clear', regions: [{ label: 'The pattern', box: [0, 0, 0.5, 0.5] }],
+      relevance: /UNRELATED/.test(cue) ? 'unrelated' : cue ? 'key' : 'supporting', why: 'Judged by its cue.'
+    };
   }
   const heard = heardIn(user);
+  if (system.startsWith('You pick the moments')) {
+    // Every cue, at the second it was said (some as "mm:ss"), naming the first share whatever was up; and, as a model
+    // can, a moment that makes no sense and one before the call started.
+    const moments = heard.flatMap((h) => {
+      if (SCROLLING.test(h.text)) return Array.from({ length: 20 }, (_, i) => ({ at: h.at + i, share: 1, cue: h.text, why: 'change' }));
+      if (STEPPING.test(h.text)) return [0, 0.3, 0.6].map((d) => ({ at: h.at + d, share: 1, cue: h.text, why: 'reference' }));
+      if (!CUE.test(h.text)) return [];
+      const at = h.at % 2 ? h.at : `${String(Math.floor(h.at / 60)).padStart(2, '0')}:${String(h.at % 60).padStart(2, '0')}`;
+      return [{ at, share: 1, cue: h.text, why: h.text.trim().endsWith('?') ? 'question' : 'reference' }];
+    });
+    return { moments: [...moments, { at: 'soon', share: 'one' }, { at: -4, share: 1, cue: 'Before it started.', why: 'reference' }] };
+  }
   const screens = screensIn(user);
   /** The screen up when a line was said, if the line is about something shown. */
   const shownAt = (h: Heard) => (POINTS.test(h.text) ? h.screen : undefined);
@@ -366,7 +366,11 @@ function notesReply(system: string, user: string, images: Buffer[], memory: Memo
       chapters: heard.filter((_, i) => i % 2 === 0).map((h, i) => ({ at: h.at, title: `Part ${i + 1}`, summary: h.text })),
       suggestedQuestions: ['What did we decide?', 'Who is doing what?', 'What happens next?'],
       // Each screen, with what was said while it was up.
-      screens: screens.map((x) => ({ n: x.n, description: `${x.title}, shown while: ${heard.find((h) => h.screen?.n === x.n)?.text ?? 'nothing was said'}` }))
+      screens: screens.map((x) => ({ n: x.n, description: `${x.title}, shown while: ${heard.find((h) => h.screen?.n === x.n)?.text ?? 'nothing was said'}` })),
+      // Each screen given in full, on the line said at or before it (or the first), as new, changed or referenced.
+      attach: attach ?? screens.map((x) => ({
+        screen: x.n, line: heard.filter((h) => h.at <= x.at).at(-1)?.ref ?? heard[0]?.ref ?? 1, why: x.hint === 'first' ? 'new' : x.hint === 'changed' ? 'change' : 'referenced'
+      }))
     };
   }
   if (system.startsWith('You compare one meeting')) {
@@ -517,11 +521,12 @@ export async function startFakeNear(): Promise<FakeNear> {
   const received: FakeNear['received'] = [];
   const prompts: string[] = [];
   const instructions: string[] = [];
-  const images: FakeNear['images'] = [];
+  const chats: FakeNear['chats'] = [];
   const transcriptions: FakeNear['transcriptions'] = [];
   let failing = 0;
   let failure: Failure = 'down';
   let failingOnly: string | undefined;
+  let attaching: unknown[] | null = null;
   let slow = 0;
   let slowOnly: string | undefined;
   let holding: (() => Promise<void>) | null = null;
@@ -533,9 +538,10 @@ export async function startFakeNear(): Promise<FakeNear> {
   const gateway = machine('cloud-api', imageNamed('dstack-0.5.12'), composeFor('cloud-api'), ohttpIds++);
   const models: Record<Task, Machine> = {
     transcript: machine('whisper', imageNamed('dstack-nvidia-0.5.12'), composeFor('whisper'), ohttpIds++),
-    notes: machine('vllm', imageNamed('dstack-nvidia-0.5.12'), composeFor('vllm'), ohttpIds++)
+    notes: machine('vllm', imageNamed('dstack-nvidia-0.5.12'), composeFor('vllm'), ohttpIds++),
+    vision: machine('vllm-vl', imageNamed('dstack-nvidia-0.5.12'), composeFor('vllm-vl'), ohttpIds++)
   };
-  const taskOf = (model: string): Task | undefined => (model === STT_MODEL ? 'transcript' : model === NOTES_MODEL ? 'notes' : undefined);
+  const taskOf = (model: string): Task | undefined => (model === STT_MODEL ? 'transcript' : model === NOTES_MODEL ? 'notes' : model === VISION_MODEL ? 'vision' : undefined);
 
   // Set once the server is listening and its address is known.
   let intel: FakeIntel | undefined;
@@ -594,11 +600,12 @@ export async function startFakeNear(): Promise<FakeNear> {
     return respond(out.status, out.body);
   }
 
-  /** What the notes model answers a chat request, as JSON. */
-  async function chat(body: Uint8Array, path: string, encryption: 'ohttp' | 'none', key: string | null): Promise<{ status: number; body: unknown }> {
+  /** What a chat model answers a chat request, as JSON. A model's own endpoint serves that model alone (`only`). */
+  async function chat(body: Uint8Array, path: string, encryption: 'ohttp' | 'none', key: string | null, only?: string): Promise<{ status: number; body: unknown }> {
     const parsed: unknown = JSON.parse(Buffer.from(body).toString('utf8'));
     const o = typeof parsed === 'object' && parsed !== null ? parsed : {};
     const model = 'model' in o ? str(o.model) : '';
+    if (only && model !== only) return { status: 404, body: { error: { message: `The model ${model} isn't served here.` } } };
     const messages = 'messages' in o && Array.isArray(o.messages) ? o.messages : [];
     // A message's content: text, or parts of text and images (data URLs), as the OpenAI chat format has them.
     const parts = (role: string): unknown[] => messages.flatMap((m: unknown) => {
@@ -616,25 +623,26 @@ export async function startFakeNear(): Promise<FakeNear> {
     calls.push({ path, model, bytes: body.length, encryption, key });
     prompts.push(user);
     instructions.push(system);
-    for (const img of sent) {
-      const comment = commentOf(img);
-      images.push({ bytes: img.length, marker: /^SCREEN:(\{.*\})\|/s.exec(comment)?.[1] ?? null, salt: comment.slice(comment.lastIndexOf('|') + 1) });
-    }
+    chats.push({ model, key, system, images: sent.length });
     if (slow && (slowOnly === undefined || user.includes(slowOnly))) { const ms = slow; slow = 0; await new Promise((r) => setTimeout(r, ms)); }
     if (holding) { const then = holding; holding = null; await then(); }
     let content: string;
     let finish = 'stop';
-    if (failing > 0 && (failingOnly === undefined || user.includes(failingOnly))) {
+    const notes = system.startsWith('You write the notes');
+    if (failing > 0 && (failingOnly === undefined || (failingOnly === 'notes' ? notes : user.includes(failingOnly)))) {
       failing--;
       if (failure === 'down') return { status: 503, body: { error: { message: 'Service unavailable' } } };
-      if (failure === 'cut-off') { finish = 'length'; content = JSON.stringify(notesReply(system, user, sent, memory)).slice(0, 60); }
+      if (failure === 'cut-off') { finish = 'length'; content = JSON.stringify(notesReply(model, system, user, sent, memory, null)).slice(0, 60); }
       else content = failure === 'stub'
         ? JSON.stringify({ summary: '...', decisions: [], questions: [], actions: [], chapters: [], suggestedQuestions: [], screens: [] })
         : failure === 'empty' ? '{}'
           : failure === 'partial' ? JSON.stringify({ summary: 'Catching up.', decided: 'none of it' })
             : failure === 'lines' ? JSON.stringify({ summary: 'Catching up.', decided: [{ text: 'We agreed on something.', lines: 3 }], proposed: [], open: [], next: [{ text: 'Kofi will do something.', lines: 'L3' }] })
             : 'Here are your notes! The team talked about a few things.';
-    } else content = JSON.stringify(notesReply(system, user, sent, memory));
+    } else {
+      content = JSON.stringify(notesReply(model, system, user, sent, memory, notes ? attaching : null));
+      if (notes) attaching = null;
+    }
     return {
       status: 200,
       body: {
@@ -666,11 +674,29 @@ export async function startFakeNear(): Promise<FakeNear> {
       }
       if (req.method === 'POST' && url.pathname === '/direct/glm/ohttp') {
         return direct(res, req, body, 'notes', async (inner) => (inner.method === 'POST' && inner.path === '/v1/chat/completions'
-          ? chat(inner.body, inner.path, 'ohttp', hex(models.notes.key)) : { status: 404, body: { error: { message: 'Not found' } } }));
+          ? chat(inner.body, inner.path, 'ohttp', hex(models.notes.key), NOTES_MODEL) : { status: 404, body: { error: { message: 'Not found' } } }));
+      }
+      // NEAR AI's registry of the models' own endpoints: public, as theirs is.
+      if (req.method === 'GET' && url.pathname === '/endpoints') {
+        return send(res, 200, { endpoints: [
+          { domain: 'whisper-large-v3.completions.near.ai', models: [STT_MODEL] }, { domain: 'glm-5-3-flash.completions.near.ai', models: [NOTES_MODEL] },
+          { domain: visionHost, models: [VISION_MODEL, UNVERIFIED_VISION_MODEL] }, { domain: 'text-only.completions.near.ai', models: ['acme/text-only'] }, { domain: 'not a host!', models: ['acme/bad-host'] }
+        ] });
       }
 
       if (req.headers.authorization !== `Bearer ${apiKey}`) return send(res, 401, { error: { message: 'Invalid API key' } });
 
+      // The catalog, as NEAR AI's lists it: what each model takes. Only the ones that take images and have their own
+      // endpoint can read shared screens; one entry is broken, as a list from elsewhere can be.
+      if (req.method === 'GET' && url.pathname === '/v1/models') {
+        const entry = (id: string, name: string, input: string[], extra: Record<string, unknown> = {}) =>
+          ({ id, object: 'model', name, owned_by: id.split('/')[0], input_modalities: input, output_modalities: ['text'], architecture: { inputModalities: input, outputModalities: ['text'] }, pricing: { input: 1 }, ...extra });
+        return send(res, 200, { object: 'list', data: [
+          entry(NOTES_MODEL, 'GLM 5.3 Flash', ['text', 'image'], { is_ready: true }), entry(VISION_MODEL, 'Qwen3 VL Test', ['text', 'image'], { is_ready: true }), entry(UNVERIFIED_VISION_MODEL, 'Vision Unverified', ['text', 'image'], { is_ready: true }),
+          entry('acme/text-only', 'Text Only', ['text']), entry('acme/vision-elsewhere', 'Vision Elsewhere', ['text', 'image']), entry('acme/bad-host', 'Bad Host', ['text', 'image']),
+          entry('acme/not-ready', 'Not Ready', ['text', 'image'], { is_ready: false }), entry(STT_MODEL, 'Whisper Large v3', ['audio']), { id: 7, name: null }
+        ] });
+      }
       if (req.method === 'GET' && url.pathname === '/v1/attestation/report') {
         if (tampered?.how === 'report-down') return send(res, 503, { error: { message: 'Service unavailable' } });
         const nonce = Buffer.from(url.searchParams.get('nonce') ?? '', 'hex');
@@ -701,6 +727,19 @@ export async function startFakeNear(): Promise<FakeNear> {
       send(res, 404, { error: { message: 'Not found' } });
     })().catch(() => send(res, 500, { error: { message: 'fake failed' } }));
   });
+  // The vision model's own endpoint, on a host of its own as NEAR AI's are: Oblivious HTTP to its attested key.
+  const visionServer = createServer((req, res) => {
+    void (async () => {
+      const body = await raw(req);
+      if (body.length) received.push({ path: '/vision/ohttp', body });
+      if (req.method !== 'POST' || new URL(req.url ?? '/', 'http://fake').pathname !== '/ohttp') return send(res, 404, { error: { message: 'Not found' } });
+      return direct(res, req, body, 'vision', async (inner) => (inner.method === 'POST' && inner.path === '/v1/chat/completions'
+        ? chat(inner.body, inner.path, 'ohttp', hex(models.vision.key), VISION_MODEL) : { status: 404, body: { error: { message: 'Not found' } } }));
+    })().catch(() => send(res, 500, { error: { message: 'fake failed' } }));
+  });
+  await new Promise<void>((r) => visionServer.listen(0, '127.0.0.1', () => r()));
+  const visionAddr = visionServer.address();
+  const visionHost = `127.0.0.1:${typeof visionAddr === 'object' && visionAddr ? visionAddr.port : 0}`;
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
   const addr = server.address();
   const origin = `http://127.0.0.1:${typeof addr === 'object' && addr ? addr.port : 0}`;
@@ -710,12 +749,14 @@ export async function startFakeNear(): Promise<FakeNear> {
   nvidia = n;
   return {
     settings: {
-      NEAR_AI_BASE_URL: `${origin}/v1`, NEAR_AI_API_KEY: apiKey, NEAR_AI_STT_URL: `${origin}/direct/whisper`, NEAR_AI_NOTES_URL: `${origin}/direct/glm`,
+      NEAR_AI_BASE_URL: `${origin}/v1`, NEAR_AI_API_KEY: apiKey, NEAR_AI_STT_URL: `${origin}/direct/whisper`, NEAR_AI_NOTES_URL: `${origin}/direct/glm`, NEAR_AI_ENDPOINTS_URL: `${origin}/endpoints`,
       INTEL_PCS_URL: i.pcsUrl, INTEL_ROOT_CA: i.rootPem, NVIDIA_NRAS_URL: n.nrasUrl, NVIDIA_ROOT_CA: n.rootPem
     },
-    calls, received, prompts, instructions, images, transcriptions,
-    keys: () => ({ transcript: hex(models.transcript.key), notes: hex(models.notes.key) }),
-    composes: () => ({ transcript: hex(sha256(utf8(models.transcript.compose))), notes: hex(sha256(utf8(models.notes.compose))), gateway: hex(sha256(utf8(gateway.compose))) }),
+    calls, received, prompts, instructions, chats, transcriptions,
+    keys: () => ({ transcript: hex(models.transcript.key), notes: hex(models.notes.key), vision: hex(models.vision.key) }),
+    composes: () => ({
+      transcript: hex(sha256(utf8(models.transcript.compose))), notes: hex(sha256(utf8(models.notes.compose))), vision: hex(sha256(utf8(models.vision.compose))), gateway: hex(sha256(utf8(gateway.compose)))
+    }),
     tamper(how, of = 'model') {
       tampered = how ? { how, of } : null;
       i.expired = how === 'expired';
@@ -733,10 +774,11 @@ export async function startFakeNear(): Promise<FakeNear> {
     },
     verdictLifetime(seconds) { n.lifetime = seconds; },
     failNext(count, how, only) { failing = count; failure = how; failingOnly = only; },
+    attachNext(attach) { attaching = attach; },
     slowNext(ms, only) { slow = ms; slowOnly = only; },
     holdNext(then) { holding = then; },
     reword(line, text) { if (text === null) memory.reworded.delete(line); else memory.reworded.set(line, text); },
     identify(line, as) { if (as === null) memory.identified.delete(line); else memory.identified.set(line, as); },
-    close: () => new Promise<void>((r) => server.close(() => r()))
+    close: () => Promise.all([new Promise<void>((r) => server.close(() => r())), new Promise<void>((r) => visionServer.close(() => r()))]).then(() => undefined)
   };
 }

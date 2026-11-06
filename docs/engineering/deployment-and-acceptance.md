@@ -40,7 +40,8 @@ Application Load Balancer for production custom domains. See
    that the selected commit still matches `main` before proceeding. Manual dispatch is restricted to
    `main`. Runs are serialized.
 4. **API release.** Build and push the commit-SHA image, which records its commit (`ALCOVE_COMMIT`, reported
-   by `/health` and `/v1/attestation`); execute the migration job, which gets only `DATABASE_URL`, and wait;
+   by `/health` and `/v1/attestation`) and carries ffmpeg for shared screens' video: ffmpeg-static's binary, pinned
+   in `apps/api/package.json`, copied to `/app/bin/ffmpeg` (`FFMPEG_PATH`), so the image changes when that pin does; execute the migration job, which gets only `DATABASE_URL`, and wait;
    deploy Cloud Run; check `/health` through its service URL. The migration job applies only the migrations
    the database hasn't had, and refuses one whose applied migrations were since edited or removed, so such a
    deploy stops before the new API starts and the previous release keeps serving (migrations only move

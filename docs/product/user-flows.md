@@ -186,7 +186,8 @@ send to anyone".
    ticked, and the call has no time until Jamie picks one from its link.
 5. **Details** reads like the finished call. The name is ready to type over, When and Who step back, and notes open
    in place: **Write notes**, and with them **Keep the transcript** (without it, it's used to write the notes and then
-   deleted), **Keep the recording** and **Read shared screens**. Past 25 people, **Set up for a big call** is already
+   deleted), **Keep the recording**, and **Read shared screens** (on unless it's turned off: whoever shares is then
+   asked whether theirs goes in the notes; off, nobody is asked and no share is kept). Past 25 people, **Set up for a big call** is already
    on, so everyone joins muted. **Documents** steps to the documents and boards you can open, by workspace, with a
    search; what's shared with you from workspaces you aren't in sits under **Shared with you**. With nothing to bring yet
    it says so, and the call works without. A call can bring 12, and anyone who can't open one is told whose it is, without
@@ -290,8 +291,8 @@ put them, and one dock at the bottom.
   unavailable** when the host's browser can't record or listen or is out of the call, **Notes off**, or **Notes requested** while
   someone has asked; the organizer's own says **Pausing…** until their pause lands), the same for everyone, which
   opens what's captured: each kind of capture and its state, who changed it and when, who gets the notes, and
-  the organizer's **Pause notes**, **Resume notes** and **Turn off** (or **Turn on notes**) and **Read shared
-  screens**, or anyone else's **Ask for notes**; **Reset my view** once you've arranged anything; **View**, which
+  the organizer's **Pause notes**, **Resume notes** and **Turn off** (or **Turn on notes**) and **Screens read
+  by** (the model that reads shared screens for this call's notes), or anyone else's **Ask for notes**; **Reset my view** once you've arranged anything; **View**, which
   changes only your screen: four layouts (**Side by side**, **Stacked**, **Screen first**, **Document first**), how
   you see people (**Tiles**, **Arches**, **Hidden**), **Auto**, **Speaker** or **Grid**, where you see yourself, and
   two ready-made layouts (**Everyone equal**, **Presenter and me**); **Catch up**; the shield, whose hover says what confidential compute covers (verified only
@@ -344,11 +345,16 @@ put them, and one dock at the bottom.
   and when it comes in as a tile a toast says who started sharing, with **Show it**. When the browser or the computer
   won't share (on a Mac, the screen-recording permission), the picker comes back and says what to do, and offers a
   tab, which needs no permission; when the sound you asked for didn't come, a toast says so. Phones and tablets can
-  see shares but can't share. Nothing shared is recorded or transcribed. While the organizer has shared screens read
-  for the notes, your bar also says **Read for the notes**, and your browser sends what changes on your share to the
-  notes: nothing for the first ten seconds of a share, and at most one frame every few seconds. Cameras never. Once
-  the notes have kept as many shared screens as they can for a call (about four hours of slides), screen notes turn
-  off for everyone, with a message saying why, and what was shared stays in the notes.
+  see shares but can't share. Nothing shared is transcribed.
+- **A share in the notes.** While notes are on or paused, and the call reads shared screens (**Read shared screens**
+  when it was scheduled, on by default), the share picker asks **Include this share in the
+  notes?** and the share button waits for **Yes** or **No**; it asks again every time, **Change** included, and
+  never with notes off or in a breakout room, where nothing shared is kept. With **Yes**, everyone sees **Read for
+  the notes** on your share, and your own browser records it (a few frames a second) from the moment it starts, but holds it in
+  your browser: nothing is sent until it's been up ten seconds, and a share that ends sooner is dropped. It goes to
+  the notes while notes are on; paused, nothing is recorded until they resume. **No**
+  keeps nothing of it. Notes going off stop it there. If your share can't reach the notes, the Notes panel says
+  so. Cameras never go in the notes.
 - **Looking closer at a share.** On someone else's share you see big, pinch or Ctrl/⌘ and the wheel to zoom where you
   point (or **+**, **−**, and **0** for the whole picture), drag to move around, and double-click for 200% and back; a
   label says how far in and a minimap where. **Freeze** (**F**) holds the picture still while the share goes on, and
@@ -599,12 +605,19 @@ Everything here comes from the server today; the screens for it are being built.
 - A written note shows the summary, **Decided**, **Still open**, **Follow-ups**, the transcript (its first five lines,
   then **Show all 24 minutes**, and how many shared screens are further on, which open from there) and, beside it, Your
   notes, what people added, who has it and its series. On a wide screen the transcript moves beside what was decided, so
-  going to a moment never takes the note away. It takes questions about the call: a suggested question or your own, in
+  going to a moment never takes the note away. When a share went in the notes, the recording plays its video above the
+  audio, in step with it, a short while after the call and before the notes are written: the share that started last
+  when two overlap, with a chip for each to switch, and a dark **Nothing shared** between shares. A button in its
+  corner fills the screen with it, with play, the time and a bar to scrub through the recording along the foot (it
+  hides while playing until the pointer moves); Escape leaves. The transcript shows a frame of a share beside the line
+  said when it began, and again beside the line where the screen changed, was talked about, or something happened on
+  it: at most one a line, and never the same screen twice in a row. The notes point at those screens; frames that
+  weren't shown only went into what the notes say, and aren't kept. It takes questions about the call: a suggested question or your own, in
   a bar that stays at the bottom while you read (suggestions show at the end of the note). Answers cite the moments in
   the recording they come from.
 - Until the notes are written, the page says the audio is saved and encrypted (or, when the call doesn't keep its
   recording, that the call has ended) and the notes are being written
-  in confidential compute, and ticks off each step (the call ended, the audio saved, the transcript) with the
+  in confidential compute, and ticks off each step (the call ended, the audio saved, the transcript, and shared screens ready to replay when a share was kept) with the
   one in progress marked. When nothing was said, it says so, the water is still, and **Play** stays on the line for the
   audio. A call that didn't keep its transcript or recording says so in one line where it would have been, and has no
   player; you can still ask about what the notes say. After **Delete notes** it lists what went; a note that isn't
@@ -619,7 +632,8 @@ Everything here comes from the server today; the screens for it are being built.
   who said it, or say it was heard right; anyone else who has the notes can correct the words of their own lines,
   or say their words were heard right. Each line says who corrected it and when, starting with what was heard.
   Once lines were corrected, the organizer is offered **Write the notes again**, which keeps what people already
-  confirmed or took on. Meanwhile everyone still reads, asks about and confirms the notes as they were, marked
+  confirmed or took on. On a call with shares in its notes, **More › Write the notes again** also lets the
+  organizer pick another model to read the shared screens, and both offers show the choice. Meanwhile everyone still reads, asks about and confirms the notes as they were, marked
   **Being written again**.
 - A call with breakout rooms has a **Breakout rooms** part under its own notes, one section per room, closed until
   opened: the room's name, who was in it and for how long, and inside, its own summary, decisions, open
@@ -805,7 +819,10 @@ goes back, with a toast saying why. Parts that don't load say so, with **Try aga
   Team (not at a personal address); and the time zone times are shown in, this computer's.
 - **Notes**: notes on or off for new calls (each call can still be set when it's scheduled), that everyone invited
   always gets them, the language they're written in ("Same as the call", or one of twelve), and how much the
-  summary says (**Short** or **Detailed**). Language and summary apply to notes written from then on.
+  summary says (**Short** or **Detailed**), and **Shared screens**: the model that reads screens shared into the
+  notes of calls you organize (**Standard (notes model)**, or one of NEAR AI's verified private vision models).
+  Language and summary apply to notes written from then on; the model to calls started from then on, and you
+  can change it during a call.
 - **Recording in the room**: **Record without a connection** (on by default), and **On this device**: how many
   recordings, and how much room, wait here to upload, with **See them** (Record's list), or **Nothing waiting**.
 - **Calendar**: Google Calendar, **Connected** with **Disconnect** (it forgets the connection and withdraws Alcove's

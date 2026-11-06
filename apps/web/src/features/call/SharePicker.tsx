@@ -5,7 +5,7 @@
  * why and what to do. Sharing while others share adds yours beside theirs; nobody's share is replaced.
  */
 import type { Person } from '@alcove/api';
-import { Button, Icon, IconButton, Modal, Notice, Switch, type IconName } from '@alcove/ui';
+import { Button, Icon, IconButton, Modal, Notice, Segmented, Switch, type IconName } from '@alcove/ui';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { useState } from 'react';
 import { listNames } from '~/lib/people';
@@ -19,10 +19,14 @@ const KINDS: { surface: ShareSurface; label: string; icon: IconName; title: stri
   { surface: 'monitor', label: 'Screen', icon: 'monitor', title: 'Your whole screen', body: 'Everything on that screen, notifications included.', go: 'Choose a screen', audio: 'Share computer sound, where your browser allows it' }
 ];
 const UI = { duration: 0.24, ease: [0.22, 0.8, 0.24, 1] } as const;
+/** The answer to "Include this share in the notes?": none until the presenter picks one. */
+type Keep = 'yes' | 'no' | 'unanswered';
+const KEEP = [{ value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' }] satisfies { value: Keep; label: string }[];
 
 /**
- * `read`: shared screens are read for the notes now (`on`), or will be once notes resume (`paused`), so the presenter
- * is told before they choose.
+ * `read`: notes are on (`on`) or paused (`paused`), so the presenter answers whether this share goes in the notes before
+ * Share does anything (paused: it's kept once notes resume). Asked again each time the picker opens; never while notes
+ * are off or in a breakout room, where nothing shared is kept.
  */
 export function SharePicker({ open, onOpenChange, sharing, others, trouble, read, onShare }: {
   open: boolean; onOpenChange: (o: boolean) => void; sharing: boolean;
@@ -35,8 +39,12 @@ export function SharePicker({ open, onOpenChange, sharing, others, trouble, read
 }) {
   const [surface, setSurface] = useState<ShareSurface>('browser');
   const [audio, setAudio] = useState(true);
+  const [keep, setKeep] = useState<Keep>('unanswered');
   const [troubleWas, setTroubleWas] = useState(trouble);
   if (trouble !== troubleWas) { setTroubleWas(trouble); if (trouble === 'system') setSurface('browser'); }
+  const [openWas, setOpenWas] = useState(open);
+  if (open !== openWas) { setOpenWas(open); if (open) setKeep('unanswered'); }
+  const asked = read !== undefined;
   const reduce = useReducedMotion();
   const kind = KINDS.find((k) => k.surface === surface) ?? KINDS[0];
   if (!kind) return null;
@@ -63,10 +71,25 @@ export function SharePicker({ open, onOpenChange, sharing, others, trouble, read
       </div>
       <div className="pk-f">
         {sound && <div className="ic-srow"><span>{sound}</span><Switch checked={audio} label={sound} onChange={setAudio} /></div>}
-        <span className="pk-note">{read === 'on' ? 'Everyone in the call sees what you share, and it’s read for the notes.' : read === 'paused' ? 'Everyone in the call sees what you share. Notes are paused; once they resume, it’s read for them.' : 'Everyone in the call sees what you share.'}</span>
+        {asked && (
+          <div className="ic-srow pk-keep">
+            <span>Include this share in the notes?<small>{keepLine(read, keep)}</small></span>
+            <Segmented value={keep} onChange={setKeep} options={KEEP} label="Include this share in the notes?" />
+          </div>
+        )}
+        <span className="pk-note">Everyone in the call sees what you share.</span>
         <Button variant="quiet" onClick={() => onOpenChange(false)}>Cancel</Button>
-        <Button variant="primary" icon="screen" onClick={() => onShare({ surface: kind.surface, audio: !!sound && audio })}>{kind.go}</Button>
+        {/* Straight into the browser's picker: nothing is awaited before it opens. */}
+        <Button variant="primary" icon="screen" disabled={asked && keep === 'unanswered'}
+          onClick={() => onShare({ surface: kind.surface, audio: !!sound && audio, notes: asked && keep === 'yes' })}>{kind.go}</Button>
       </div>
     </Modal>
   );
+}
+
+/** What the answer means, under the question. */
+function keepLine(read: 'on' | 'paused', keep: Keep): string {
+  if (keep === 'no') return 'Only the people here see it. Nothing of it is kept.';
+  if (keep === 'yes') return read === 'paused' ? 'Notes are paused. Once they resume, it’s recorded and read for the notes.' : 'It’s recorded with the call and read for the notes.';
+  return read === 'paused' ? 'Notes are paused. A yes is recorded and read once they resume.' : 'A yes is recorded with the call and read for the notes.';
 }

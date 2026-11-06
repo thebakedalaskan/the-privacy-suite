@@ -8,7 +8,7 @@ import { PlayMediaSchema, PlayPositionSchema, PresentKindSchema, PresentSectionS
 import { CaptureDevicePartSchema } from './capture';
 import { CallPlaceSchema } from './live';
 import { CatchUpRangeSchema } from './catchup';
-import { CaptionLanguageSchema, ISODateSchema, RsvpSchema, isTimeZone } from './types';
+import { CaptionLanguageSchema, ISODateSchema, ModelIdSchema, RsvpSchema, isTimeZone } from './types';
 import { RingReplySchema } from './rings';
 import { DocumentRoleSchema, ItemIdSchema } from './workspaces';
 /**
@@ -51,8 +51,8 @@ const CallStepSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('decline-notes'), requestId: z.string().min(1).max(64) }),
   /** The host's browser says what it can't capture now (none, when it can again): everyone sees it, so nobody is told they're captured when they aren't. */
   z.object({ type: z.literal('unavailable'), parts: z.array(CaptureDevicePartSchema).max(2) }),
-  /** The organizer has shared screens read for the notes, or stops it. Only while notes are on or paused; turning notes off stops it too. */
-  z.object({ type: z.literal('screens'), on: z.boolean() }),
+  /** The organizer chooses the vision model that reads shared screens for the notes (an ID from `models.vision()`), or the notes model (null). */
+  z.object({ type: z.literal('screen-model'), model: ModelIdSchema.nullable() }),
   /** Anyone in the call: a raised hand, which everyone sees. */
   z.object({ type: z.literal('hand'), up: z.boolean() }),
   /** Anyone in the call: whether others may point at and mark what they share. On until they turn it off. */
@@ -191,19 +191,26 @@ export const LIVE_TRANSCRIPT_LINES = 200;
 export const MAX_TRANSCRIPT_CLIP_MS = 30_000;
 export const MAX_TRANSCRIPT_CLIP_BYTES = 44 + MAX_TRANSCRIPT_CLIP_MS * 32;
 /*
- * Shared screens (docs: Calls and recordings › Shared screens). The presenter's own browser sends a frame of its own
- * share, as JPEG bytes, when the screen has changed: which share it is (`share`, the share's LiveKit track ID) and how
- * long ago it was taken (`age`, in ms), so it's placed where it was on screen even if sending it took a moment.
+ * Shared screens (docs: Calls and recordings › Shared screens). A presenter's browser says each share is starting, and
+ * whether it goes in the notes; the server gives it an ID. While it's kept, the browser records it and sends the video
+ * in pieces, raw bytes with the piece's MIME type and, in these headers, where it goes: the recording's segment, the
+ * piece's sequence number in that segment for this share, where it starts in the segment (`at`, in milliseconds with
+ * pauses not counted) and its length. The share is in the path.
  */
-export const FRAME_HEADERS = { share: 'x-alcove-share', age: 'x-alcove-age-ms' } as const;
-/** A frame's JPEG, at most this big. Browsers send them at most 1600 pixels across, which is far smaller. */
-export const MAX_FRAME_BYTES = 1024 * 1024;
-/** How old a frame can say it is when it arrives: older ones are placed as if taken this long ago. */
-export const MAX_FRAME_AGE_MS = 30_000;
-/** A share: the LiveKit track ID of someone's shared screen, as LiveKit names tracks. */
+export const VIDEO_HEADERS = { segment: 'x-alcove-segment', seq: 'x-alcove-seq', at: 'x-alcove-at-ms', duration: 'x-alcove-duration-ms' } as const;
+/** A piece of a shared screen's video, at most this big. Five seconds at the rate browsers record is far smaller. */
+export const MAX_VIDEO_PIECE_BYTES = 4 * 1024 * 1024;
+/**
+ * The most frames of shared screens one call's notes read: picked from what was said, each share's start and end, and
+ * filled in so no stretch of sharing goes more than ten seconds without one.
+ */
+export const MAX_SCREEN_FRAMES = 500;
+/** A share: the LiveKit track ID of someone's shared screen, as LiveKit names tracks. Pointers and marks say which share they're on by it. */
 export const ShareIdSchema = z.string().regex(/^TR_[A-Za-z0-9]{2,64}$/);
-/** The presenter's browser says one of its shares ended, so the last frame's stretch ends there too. */
-export const ShareEndedBodySchema = z.object({ share: ShareIdSchema });
+/** A presenter starting a share: whether it goes in the notes. Refused with notes when they're off. */
+export const ShareStartBodySchema = z.object({ notes: z.boolean() });
+/** Writing the notes again: optionally with another vision model for shared screens (an ID from `models.vision()`, or null for the notes model). */
+export const RewriteBodySchema = z.object({ screenModel: ModelIdSchema.nullable().optional() });
 
 /** Asking about a call: the question travels in the body. */
 export const AskBodySchema = z.object({ question: z.string().trim().min(1).max(500) });

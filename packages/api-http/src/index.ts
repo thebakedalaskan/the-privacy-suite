@@ -4,12 +4,13 @@
  * from the contract fails loudly here instead of corrupting the UI.
  */
 import {
-  AlcoveApiError, AnswerPartSchema, AttestationSchema, AUDIO_HEADERS, BusySchema, CreatedSchema, DocVersionLineSchema, DOC_UPDATE_TYPE, DocAppendedSchema, DocLiveEventSchema, DocVersionSummarySchema, SearchDocSchema, DocumentShareSchema, WorkspaceItemSchema, WorkspaceLiveEventSchema, WorkspacePersonSchema, WorkspaceSummarySchema, WorkspaceTreeSchema, DocumentLibrarySchema, CALL_DATA_OVERHEAD, LIVE_TRANSCRIPT_LINES, CALL_CHAT_MAX, CALL_PASS_HEADER, CALL_VOID_KEY_INDEX, CalendarSchema, BoardCheckSchema, CallCardSchema, CallEndResultSchema, CallMlsSchema, CaptionTranslationSchema, CallRoomTokenSchema, CallStateSchema, CallTicketSchema, CallAnswerSchema, CallMomentSchema, CatchUpSchema, CatchUpWindowSchema, CreditBalanceSchema, FRAME_HEADERS, MAIN_PLACE, MeetingSchema, NoteProgressSchema, NoteSchema, NotesWatchedSchema, ScreenFrameReceiptSchema, CallFollowUpsSchema, CallWorkspaceSwitchSchema, DocAskPartSchema, PresenterNotesSchema, MediaTokenAnswerSchema, WorkspaceMediaSchema,
+  AlcoveApiError, AnswerPartSchema, AttestationSchema, AUDIO_HEADERS, BusySchema, CreatedSchema, DocVersionLineSchema, DOC_UPDATE_TYPE, DocAppendedSchema, DocLiveEventSchema, DocVersionSummarySchema, SearchDocSchema, DocumentShareSchema, WorkspaceItemSchema, WorkspaceLiveEventSchema, WorkspacePersonSchema, WorkspaceSummarySchema, WorkspaceTreeSchema, DocumentLibrarySchema, CALL_DATA_OVERHEAD, LIVE_TRANSCRIPT_LINES, CALL_CHAT_MAX, CALL_PASS_HEADER, CALL_VOID_KEY_INDEX, CalendarSchema, BoardCheckSchema, CallCardSchema, CallEndResultSchema, CallMlsSchema, CaptionTranslationSchema, CallRoomTokenSchema, CallStateSchema, CallTicketSchema, CallAnswerSchema, CallMomentSchema, CatchUpSchema, CatchUpWindowSchema, CreditBalanceSchema, MAIN_PLACE, MeetingSchema, NoteProgressSchema, NoteSchema, NotesWatchedSchema, CallFollowUpsSchema, CallWorkspaceSwitchSchema, DocAskPartSchema, PresenterNotesSchema, MediaTokenAnswerSchema, WorkspaceMediaSchema,
   NoteFoundSchema, OPERATION_HEADER, InboxSchema, PersonSuggestionSchema, PreferencesSchema, RecordingStopResultSchema, REQUEST_ID_HEADER, RingsSnapshotSchema, PersonalNotesSchema, PromotionPreviewSchema,
   SeriesAnswerPartSchema, SeriesSchema,
   RoomRecordingStateSchema, SessionSchema, SignInResultSchema, TeamSchema, errorCode, fromBase64Url, isAlcoveErrorCode, MoveClaimSchema, MoveCodeSchema, MoveInSchema, MoveOutSchema,
   type AlcoveApi, type AudioPiece, type BoardCheck, type BoardOpen, type BreakoutPlan, type CallAction, type CallFollowUps, type CallWorkspaceSwitch, type ChangeScope, type DocFollowUpTick, type DocumentRole, type PresentKind, type CaptionLanguage, type CaptureDevicePart, type CaptionTranslation, type CallCrypto, type CallMediaKeys, type CallMls, type CallMoveOut, type CallSession, type CallState, type CallTicket, type LiveStore, type MoveMedia, type MoveOut, type CallAnswer, type CallMoment, type CatchUp, type CatchUpRange, type CatchUpWindow, type RecordingAction, type RoomRecording, type PersonalApi,
-  type RoomRecordingState, type ScreenFrame, type ScreenFrameReceipt, type SeriesAnswerPart, type TranscriptClip, type WorkspaceReadOptions
+  ShareStartedSchema, VIDEO_HEADERS, VisionModelSchema,
+  type RoomRecordingState, type ScreenPiece, type SeriesAnswerPart, type TranscriptClip, type WorkspaceReadOptions
 } from '@alcove/api';
 import type { DocVersionSummary } from '@alcove/api';
 import { pictureReader, sendFile } from './media';
@@ -181,11 +182,13 @@ export function createHttpApi(o: HttpOptions): AlcoveApi {
       act: (id, a) => req(CallStateSchema, 'POST', `${live(id)}/actions`, a, p),
       audio: async (id, piece) => parse(CallStateSchema, await audio(`${live(id)}/audio`, piece, p), 'call state'),
       transcribe: async (id, c, speaker) => parse(CallStateSchema, await clip(`${live(id)}/transcribe`, c, { ...p, [AUDIO_HEADERS.speaker]: speaker, [AUDIO_HEADERS.ago]: ago(c) }), 'call state'),
-      // A frame of this browser's own share: JPEG bytes, which share, and how long ago it was taken.
-      frame: async (id, f) => parse(ScreenFrameReceiptSchema, await (await send('POST', `${live(id)}/frames`, f.data, {
-        ...p, 'content-type': 'image/jpeg', [FRAME_HEADERS.share]: f.share, [FRAME_HEADERS.age]: String(Math.max(0, Math.round(Date.now() - f.takenAt)))
-      })).json(), 'frame receipt'),
-      shareEnded: async (id, share) => { await req(z.object({ ended: z.literal(true) }), 'POST', `${live(id)}/frames/ended`, { share }, p); },
+      startShare: (id, notes) => req(ShareStartedSchema, 'POST', `${live(id)}/shares`, { notes }, p),
+      // A piece of this browser's own kept share: video bytes, placed by the headers; the share is in the path.
+      screen: async (id, piece) => parse(CallStateSchema, await (await send('POST', `${live(id)}/shares/${encodeURIComponent(piece.share)}/video`, piece.data, {
+        ...p, 'content-type': piece.mimeType, [VIDEO_HEADERS.segment]: String(piece.segment), [VIDEO_HEADERS.seq]: String(piece.seq),
+        [VIDEO_HEADERS.at]: atMs(piece.at), [VIDEO_HEADERS.duration]: String(Math.round(piece.durationMs))
+      })).json(), 'call state'),
+      shareEnded: (id, share) => req(CallStateSchema, 'POST', `${live(id)}/shares/${encodeURIComponent(share)}/ended`, {}, p),
       watchNotes: async (id) => (await req(NotesWatchedSchema, 'POST', `${live(id)}/notes/watch`, {}, p)).refreshed,
       followUps: (id) => req(CallFollowUpsSchema, 'GET', `${live(id)}/follow-ups`, undefined, p),
       tickDocument: (id, t) => req(CallFollowUpsSchema, 'POST', `${live(id)}/follow-ups`, t, p),
@@ -312,13 +315,14 @@ export function createHttpApi(o: HttpOptions): AlcoveApi {
       screenUrl: (id, frameId) => `${base}/notes/${encodeURIComponent(id)}/screens/${encodeURIComponent(frameId)}`,
       proposeDecision: (noteId, proposal) => req(NoteSchema, 'POST', `/notes/${encodeURIComponent(noteId)}/decisions`, proposal),
       proposeAction: (noteId, proposal) => req(NoteSchema, 'POST', `/notes/${encodeURIComponent(noteId)}/actions`, proposal),
+      screenVideoUrl: (id, share, segment) => `${base}/notes/${encodeURIComponent(id)}/screen/${encodeURIComponent(share)}/${segment}`,
       updateDecision: (noteId, decisionId, patch) => req(NoteSchema, 'PATCH', `/notes/${encodeURIComponent(noteId)}/decisions/${encodeURIComponent(decisionId)}`, patch),
       updateAction: (noteId, actionId, patch) => req(NoteSchema, 'PATCH', `/notes/${encodeURIComponent(noteId)}/actions/${encodeURIComponent(actionId)}`, patch),
       updateQuestion: (noteId, questionId, patch) => req(NoteSchema, 'PATCH', `/notes/${encodeURIComponent(noteId)}/questions/${encodeURIComponent(questionId)}`, patch),
       updateRevisit: (noteId, revisitId, patch) => req(NoteSchema, 'PATCH', `/notes/${encodeURIComponent(noteId)}/revisits/${encodeURIComponent(revisitId)}`, patch),
       inbox: () => req(InboxSchema, 'GET', '/notes/inbox'),
       correctLine: (noteId, lineId, patch) => req(NoteSchema, 'PATCH', `/notes/${encodeURIComponent(noteId)}/lines/${encodeURIComponent(lineId)}`, patch),
-      rewrite: (noteId) => req(NoteSchema, 'POST', `/notes/${encodeURIComponent(noteId)}/rewrite`, {}),
+      rewrite: (noteId, o) => req(NoteSchema, 'POST', `/notes/${encodeURIComponent(noteId)}/rewrite`, o?.screenModel !== undefined ? { screenModel: o.screenModel } : {}),
       ask: async function* (noteId, question) {
         const parts = await req(z.array(AnswerPartSchema), 'POST', `/notes/${encodeURIComponent(noteId)}/ask`, { question });
         yield* parts;
@@ -439,6 +443,9 @@ export function createHttpApi(o: HttpOptions): AlcoveApi {
     credits: {
       balance: () => req(CreditBalanceSchema, 'GET', '/credits')
     },
+    models: {
+      vision: () => req(z.array(VisionModelSchema), 'GET', '/models/vision')
+    },
     trust: {
       attestation: (nonce) => req(AttestationSchema, 'GET', `/attestation?nonce=${encodeURIComponent(nonce)}`)
     },
@@ -458,8 +465,9 @@ interface CallTransport {
   act(id: string, a: CallAction): Promise<CallState>;
   audio(id: string, p: AudioPiece): Promise<CallState>;
   transcribe(id: string, c: TranscriptClip, speaker: string): Promise<CallState>;
-  frame(id: string, f: ScreenFrame): Promise<ScreenFrameReceipt>;
-  shareEnded(id: string, share: string): Promise<void>;
+  startShare(id: string, notes: boolean): Promise<z.infer<typeof ShareStartedSchema>>;
+  screen(id: string, p: ScreenPiece): Promise<CallState>;
+  shareEnded(id: string, share: string): Promise<CallState>;
   /** Says this browser is looking at the live notes. True when that refreshed them. */
   watchNotes(id: string): Promise<boolean>;
   followUps(id: string): Promise<CallFollowUps>;
@@ -1131,7 +1139,6 @@ class HttpCall extends Live<CallState> implements CallSession {
   requestNotes = async (up: boolean) => { this.take(await this.t.act(this.state.callId, { type: 'request-notes', up })); };
   declineNotes = async (requestId: string) => { this.take(await this.t.act(this.state.callId, { type: 'decline-notes', requestId })); };
   setUnavailable = async (parts: CaptureDevicePart[]) => { this.take(await this.t.act(this.state.callId, { type: 'unavailable', parts })); };
-  setScreens = async (on: boolean) => { this.take(await this.t.act(this.state.callId, { type: 'screens', on })); };
   tickFollowUp = async (id: string, done: boolean) => { this.take(await this.t.act(this.state.callId, { type: 'follow-up', id, done })); };
   private space = async (a: CallAction) => { this.take(await this.t.act(this.state.callId, a)); };
   openWorkspace = () => this.space({ type: 'workspace-open' });
@@ -1154,8 +1161,14 @@ class HttpCall extends Live<CallState> implements CallSession {
   closeBoard = () => this.space({ type: 'board-close' });
   boardCheck = (documentId: string) => this.t.boardCheck(this.state.callId, documentId);
   tickDocumentFollowUp = async (tick: DocFollowUpTick) => { this.followUps.set(await this.t.tickDocument(this.state.callId, tick)); };
-  shareFrame = (f: ScreenFrame) => this.t.frame(this.state.callId, f);
-  shareEnded = (share: string) => this.t.shareEnded(this.state.callId, share);
+  setScreenModel = async (model: string | null) => { this.take(await this.t.act(this.state.callId, { type: 'screen-model', model })); };
+  startShare = async (o: { notes: boolean }) => {
+    const r = await this.t.startShare(this.state.callId, o.notes);
+    this.take(r.state);
+    return { share: r.share, keep: r.keep };
+  };
+  appendScreen = async (piece: ScreenPiece) => { this.take(await this.t.screen(this.state.callId, piece)); };
+  shareEnded = async (share: string) => { this.take(await this.t.shareEnded(this.state.callId, share)); };
   mute = async (identity: string, trackSid: string) => { this.take(await this.t.act(this.state.callId, { type: 'mute', identity, trackSid })); };
   /** They're disconnected at once; the host's browser then takes them out of their group, so the keys move on without them. */
   remove = async (identity: string) => { this.take(await this.t.act(this.state.callId, { type: 'remove', identity })); await this.sync(); };

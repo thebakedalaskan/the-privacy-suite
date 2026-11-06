@@ -3,17 +3,18 @@
  * HTTP via @alcove/api-http, real Postgres, the object store, LiveKit and the fake NEAR AI. "Deleted" is checked where
  * it would still be otherwise: every revision of the note, opened with its owner's keys; the rows beside it; the bucket.
  */
-import { AlcoveApiError, DEFAULT_NOTES_CHOICES, type AlcoveApi, type AnswerPart, type AudioPiece, type CallSession, type CallState, type MeetingInput, type NoteProgress, type NotesChoices, type ScreenFrame, type TranscriptClip } from '@alcove/api';
+import { AlcoveApiError, DEFAULT_NOTES_CHOICES, type AlcoveApi, type AnswerPart, type AudioPiece, type CallSession, type CallState, type MeetingInput, type NoteProgress, type NotesChoices, type ScreenPiece, type TranscriptClip } from '@alcove/api';
 import { randomBytes } from 'node:crypto';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-import { openJson, openKey, sealJson, stateKey, toJson } from './crypto';
+import { openJson, openKey } from './crypto';
 import { tx } from './db';
 import { maintain } from './maintenance';
 import { openOwner } from './owners';
-import { screenJpeg, speechWav } from './testing/fake-near';
+import { speechWav } from './testing/fake-near';
 import { startHarness, type Harness } from './testing/harness';
-import { connect, disposeLiveKit, type TestParticipant } from './testing/livekit';
+import { disposeLiveKit, type TestParticipant } from './testing/livekit';
+import { cut, recordedWebm } from './testing/video';
 import { getItem, saveRevision } from './vault';
 
 // Sharing a screen goes through a real LiveKit server, which a busy CI runner can be slow to set up.
@@ -47,6 +48,7 @@ async function waitFor(pred: () => boolean | Promise<boolean>, what: string, ms 
 const audioBytes = (marker: string) => { const src = Buffer.concat([Buffer.from(marker), randomBytes(2048)]); const out = new Uint8Array(new ArrayBuffer(src.length)); out.set(src); return out; };
 /** A piece of audio, number `at` of its segment: five seconds of it unless said otherwise. */
 const piece = (marker: string, segment: number, at: number, durationMs = 5000): AudioPiece => ({ data: new Blob([audioBytes(marker)]), segment, seq: at, at: at * 5, durationMs, mimeType: 'audio/webm;codecs=opus' });
+const screenPiece = (share: string, i: number, data: Uint8Array<ArrayBuffer>): ScreenPiece => ({ data: new Blob([data]), share, segment: 0, seq: i, at: i * 5, durationMs: 5000, mimeType: 'video/webm;codecs=vp8' });
 const speech = (words: string, segment: number, atMs: number, ms = 6000): TranscriptClip => ({ data: new Blob([speechWav(words, ms)], { type: 'audio/wav' }), segment, at: atMs / 1000, durationMs: ms });
 async function written(api: AlcoveApi, noteId: string): Promise<NoteProgress[]> {
   const steps: NoteProgress[] = [];
@@ -370,21 +372,19 @@ describe('keeping the recording', () => {
   it('keeps shared screens, which its key seals, and with neither kept the notes still stand on their own', async () => {
     const org = await account(unique('organizer'));
     const { call } = await held(org, { keepTranscript: false, keepRecording: false, readScreens: true });
-    await waitFor(() => call.crypto.getSnapshot().status === 'in' && call.crypto.getSnapshot().media !== null, 'the organizer in the call’s group');
-    const p = await connect(await call.room(), { sending: call.crypto });
-    open.push(p);
-    const { screen } = await p.publishScreen(false);
-    await waitFor(async () => (await h.deps.livekit.screenShares(p.room.name ?? '')).some((x) => x.sid === screen), 'LiveKit to list the share');
-    const frame: ScreenFrame = { data: new Blob([screenJpeg({ title: 'Supplier list', lines: ['Halberd'] })], { type: 'image/jpeg' }), share: screen, takenAt: Date.now() };
-    // Nobody turned screens on: the call was scheduled to read them.
-    const { id } = await call.shareFrame(frame);
+    const { share } = await call.startShare({ notes: true });
+    for (const [i, data] of cut(await recordedWebm(10), 2).entries()) await call.appendScreen(screenPiece(share, i, data));
+    await call.shareEnded(share);
     await call.appendAudio(piece('gone', 0, 0));
     await call.transcribe(speech(SAID, 0, 0), call.ticket.identity);
     const noteId = await noteOf(call);
     await written(org.api, noteId);
     const note = await org.api.notes.get(noteId);
-    expect(note).toMatchObject({ status: 'ready', transcript: [], audio: [], kept: { transcript: false, recording: false }, screens: [{ id, title: 'Supplier list' }], decisions: [{ text: DECIDED }] });
-    expect((await org.fetch(org.api.notes.screenUrl(noteId, id))).status).toBe(200);
+    expect(note).toMatchObject({ status: 'ready', transcript: [], audio: [], kept: { transcript: false, recording: false }, decisions: [{ text: DECIDED }] });
+    expect(note.shares).toHaveLength(1);
+    const [moment] = note.screens;
+    expect(moment?.share).toBe(share);
+    expect((await org.fetch(org.api.notes.screenUrl(noteId, moment?.id ?? ''))).status).toBe(200);
     expect(await piecesOf(org.session.ownerId)).toEqual([]);
     expect(await revisionsOf(org.session.ownerId, noteId)).toHaveLength(1);
   });
@@ -653,47 +653,29 @@ describe('a call with breakout rooms', () => {
   });
 });
 
-describe('reading shared screens from the start', () => {
-  it('turns them on with notes, as scheduled, for everyone to see', async () => {
+describe('the organizer’s permission to read shared screens', () => {
+  it('lets a presenter keep a share for the notes when scheduled so, and shows everyone while it goes', async () => {
     const org = await account(unique('organizer'));
     const { meeting, call } = await held(org, { readScreens: true });
-    expect(call.getSnapshot().capture.screen).toEqual({ mode: 'on', since: expect.any(String), by: { kind: 'schedule' } });
-    expect(call.getSnapshot().notices.at(-1)?.text).toBe('Notes are on, and what anyone shares is read for them. Everyone here can see that.');
-    expect(await h.browser().api.calls.card(meeting.code)).toMatchObject({ choices: { readScreens: true }, capture: { screen: { mode: 'on', by: { kind: 'schedule' } } } });
-    // From then on it's the organizer's, as if they'd turned it on: turning notes off stops it, and it doesn't come back with them.
-    await call.setNotes(false);
-    expect(call.getSnapshot().capture.screen.mode).toBe('off');
-    await call.setNotes(true);
+    expect(call.getSnapshot().capture).toMatchObject({ readScreens: true, screen: { mode: 'off' } });
+    expect(await h.browser().api.calls.card(meeting.code)).toMatchObject({ choices: { readScreens: true } });
+    const { share, keep } = await call.startShare({ notes: true });
+    expect(keep).toBe(true);
+    expect(call.getSnapshot().capture.screen.mode).toBe('on');
+    await call.shareEnded(share);
     expect(call.getSnapshot().capture.screen.mode).toBe('off');
     await call.leave();
   });
 
-  it('waits for notes: a call scheduled without them starts reading screens when the organizer turns them on', async () => {
+  it('refuses to keep a share when scheduled not to, but still lets it be shared', async () => {
     const org = await account(unique('organizer'));
-    const { call } = await held(org, { readScreens: true }, { notes: 'off' });
-    expect(call.getSnapshot().capture).toMatchObject({ mode: 'off', screen: { mode: 'off', since: null, by: null } });
-    await call.setNotes(true);
-    expect(call.getSnapshot().capture.screen).toEqual({ mode: 'on', since: expect.any(String), by: { kind: 'organizer', name: org.session.user.name } });
-    expect(call.getSnapshot().notices.at(-1)?.text).toBe('The organizer turned on notes, and what anyone shares is read for them. Everyone here can see that.');
-    await call.leave();
-  });
-});
-
-describe('a call sealed by the previous release', () => {
-  it('reads its shared screens as turned on by the organizer, the only one who could have', async () => {
-    const org = await account(unique('organizer'));
-    const { call } = await held(org, { readScreens: true });
-    const { ownerId } = org.session;
-    const { callId } = call.ticket;
-    const o = await openOwner(h.deps, ownerId, undefined);
-    const key = stateKey(o.root, ownerId, `call:${callId}`);
-    const header = { v: 1, kind: 'call-state', ownerId, callId } as const;
-    const row = z.object({ state_ciphertext: z.instanceof(Uint8Array) }).parse((await h.pool.query('SELECT state_ciphertext FROM calls WHERE owner_id = $1 AND call_id = $2', [ownerId, callId])).rows[0]);
-    // Parsed without `by`, which drops it, and sealed as the release before this one sealed it.
-    const Older = z.looseObject({ notes: z.looseObject({ screens: z.looseObject({ history: z.array(z.object({ at: z.number(), on: z.boolean(), segment: z.number() })) }) }) });
-    await h.pool.query('UPDATE calls SET state_ciphertext = $3 WHERE owner_id = $1 AND call_id = $2', [ownerId, callId, sealJson(key, header, toJson(openJson(key, header, row.state_ciphertext, Older)))]);
-    await call.refresh();
-    expect(call.getSnapshot().capture.screen).toEqual({ mode: 'on', since: expect.any(String), by: { kind: 'organizer', name: org.session.user.name } });
+    const { meeting, call } = await held(org, { readScreens: false });
+    expect(call.getSnapshot().capture).toMatchObject({ readScreens: false, screen: { mode: 'off' } });
+    expect(await h.browser().api.calls.card(meeting.code)).toMatchObject({ choices: { readScreens: false } });
+    expect(await fails(call.startShare({ notes: true }))).toEqual(['conflict', 'The organizer keeps shared screens out of these notes.']);
+    const plain = await call.startShare({ notes: false });
+    expect(plain.keep).toBe(false);
+    expect(call.getSnapshot().capture.screen.mode).toBe('off');
     await call.leave();
   });
 });

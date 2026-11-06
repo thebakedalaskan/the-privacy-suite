@@ -65,6 +65,11 @@ const EnvSchema = z.object({
   NEAR_AI_NOTES_MODEL: z.string().min(1).default('z-ai/glm-5.3-flash'),
   /** The notes model's own endpoint: requests go to its /ohttp, sealed to the key its attestation vouches for. */
   NEAR_AI_NOTES_URL: z.string().url().default('https://glm-5-3-flash.completions.near.ai'),
+  /**
+   * NEAR AI's registry of the hosts that serve the models it runs itself: where a vision model chosen to read shared
+   * screens is sent (modules/models.ts), sealed to its attested key like every request.
+   */
+  NEAR_AI_ENDPOINTS_URL: z.string().url().default('https://completions.near.ai/endpoints'),
   /** Intel's Provisioning Certification Service: the TCB info, QE identity and revocation lists a TDX quote is checked against. */
   INTEL_PCS_URL: z.string().url().default(INTEL_PCS),
   /** The root every TDX quote and Intel collateral must chain to: Intel's SGX Root CA. Tests set their own. */
@@ -73,8 +78,6 @@ const EnvSchema = z.object({
   NVIDIA_NRAS_URL: z.string().url().default(NVIDIA_NRAS),
   /** The root NRAS's signing keys must chain to: NVIDIA Attestation Service CA 001. Tests set their own. */
   NVIDIA_ROOT_CA: RootCa('NVIDIA_ROOT_CA', NVIDIA_NRAS_ROOT_CA),
-  /** At most this many shared-screen frames in one call's notes: about one a minute for four hours. Then screen notes turn off for everyone, saying why. */
-  SCREEN_FRAMES_MAX: z.coerce.number().int().min(1).max(10_000).default(240),
   /** How long a browser's stream of rings lasts, at most, before it opens a new one: under Cloud Run's 300-second request timeout. */
   RING_STREAM_SECONDS: z.coerce.number().int().min(1).max(280).default(240),
   /** How often a live stream says it's still there, and checks who's reading it, in ms. */

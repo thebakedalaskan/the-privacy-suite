@@ -8,7 +8,7 @@
  * room captures at most what the call does, and the organizer can pause one room on its own.
  */
 import { z } from './zod';
-import { CaptureGapSchema, IDSchema, ISODateSchema } from './types';
+import { CaptureGapSchema, IDSchema, ISODateSchema, ModelIdSchema } from './types';
 
 /**
  * on: being captured. paused: the organizer is holding it until they resume. off: not captured. unavailable: notes
@@ -81,12 +81,22 @@ export const CaptureStateSchema = z.object({
    */
   ai: CapturePartSchema,
   /**
-   * Shared screens read for the notes: each presenter's own browser sends frames of their share when it changes, and
-   * the private notes model reads them. Off until the organizer turns it on; it runs only while notes are on, pauses
-   * with them, and stops when they're turned off, or once the notes have kept as many frames as they can for the call.
-   * Cameras are never read.
+   * Shared screens kept for the notes: on while anyone is sharing a screen they said goes in the notes (each presenter
+   * answers for each share, and only while notes are on). Their own browser records the share, encrypted and kept with
+   * the call's audio; after the call, frames picked from what was said are read by the chosen vision model. Pauses with
+   * notes and stops when they're turned off. Cameras are never recorded.
    */
   screen: CapturePartSchema,
+  /**
+   * The vision model the organizer chose to read shared screens for this call's notes, by its ID in `models.vision()`.
+   * Null means the notes model.
+   */
+  screenModel: ModelIdSchema.nullable(),
+  /**
+   * Whether the organizer lets shared screens go in these notes (the call's `readScreens` choice). Without it nobody is
+   * asked, and no share is kept.
+   */
+  readScreens: z.boolean(),
   /** The stretches with nothing captured, oldest first; the last may still be going. Empty for people asking to join. */
   gaps: z.array(CaptureGapSchema),
   /** Open asks for notes. Empty for people asking to join. */

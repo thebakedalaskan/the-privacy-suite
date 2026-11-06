@@ -6,11 +6,11 @@
  * only after that check.
  */
 import {
-  ActionItemSchema, CaptureGapSchema, ChangerSchema, ChapterSchema, DecisionSchema, InferenceEvidenceSchema, NoteKindSchema, NoteStatusSchema, QuestionSchema, RoomNoteSchema, ScreenMomentSchema, TranscriptLineSchema,
+  ActionItemSchema, CaptureGapSchema, ChangerSchema, ChapterSchema, DecisionSchema, InferenceEvidenceSchema, ModelIdSchema, NoteKindSchema, NoteStatusSchema, QuestionSchema, RoomNoteSchema, ScreenMomentSchema, TranscriptLineSchema,
   isAssignee, isBy, isProposer, mayAssign, mayChangeAction, mayDecide, mayDispute, mayRewordDecision, maySayNotReplaced, minutesLabel, searchOf, termsIn,
   type ActionItem, type ActionPatch, type ActionProposal, type AnswerPart, type CaptureGap, type Change, type Chapter, type Decision, type DecisionPatch, type DecisionProposal, type GroupShare, type Inbox, type LinePatch,
   type Note, type NoteFound, type NoteKind, type NoteProgress, type NoteReader, type NoteSaid, type NoteSearch, type NoteSummary, type OpenAction, type PendingDecision, type Person, type Question, type QuestionPatch, type Received, type Recipient, type RecipientRole,
-  type RevisitPatch, type RoomNote, type RoomRef, type ScreenMoment, type Speaker, type TranscriptLine
+  type RevisitPatch, type RoomNote, type RoomRef, type Speaker, type TranscriptLine
 } from '@alcove/api';
 import { z } from 'zod';
 import type { Owner } from '../context';
@@ -91,7 +91,7 @@ export const NoteManifest = z.object({
   summary: z.string(), decisions: z.array(DecisionSchema), questions: z.array(QuestionSchema), actions: z.array(ActionItemSchema), chapters: z.array(ChapterSchema),
   /** The stretches of the call nothing was captured in (notes off or paused), where they fall in the recording. */
   gaps: z.array(CaptureGapSchema),
-  /** What was on shared screens while screen notes were on: each frame kept (its image is in screen_frames), read and described once the notes are written. */
+  /** What was on shared screens kept for the notes: each frame kept (its image is in screen_frames), read and described once the notes are written. */
   screens: z.array(ScreenMomentSchema), transcript: z.array(TranscriptLineSchema).nullable(), suggestedQuestions: z.array(z.string()),
   /** When the notes were last written from the transcript (ISO), or null until they have been. */
   writtenAt: z.string().nullable(),
@@ -119,7 +119,9 @@ export const NoteManifest = z.object({
    */
   ticked: z.array(Ticked).default([]),
   /** What was worked on in the call, and by whom: only IDs and who, read for each person by what they can open. Empty in a note stored before calls kept it. */
-  workedOn: z.array(WorkedDocument).default([])
+  workedOn: z.array(WorkedDocument).default([]),
+  /** The vision model that reads shared screens for these notes (the organizer's choice in the call, or when writing them again), or null for the notes model. */
+  screenModel: ModelIdSchema.nullable().default(null)
 });
 export type NoteManifest = z.infer<typeof NoteManifest>;
 /** A note's follow-ups: the call's, then each breakout room's. */
@@ -136,7 +138,7 @@ export function blankNote(o: { kind: NoteKind; title: string; startedAt: Date; r
     kind: o.kind, title: o.title, startedAt: o.startedAt.toISOString(), duration: 0, recordingId: o.recordingId,
     ...(o.meetingId ? { meetingId: o.meetingId } : {}), invited: o.invited, shared: [],
     status: 'recording', summary: '', decisions: [], questions: [], actions: [], chapters: [], gaps: [], screens: [], transcript: null, rooms: [], suggestedQuestions: [], writtenAt: null, workedOn: [],
-    breakouts: [], inference: [], keep: o.keep ?? KEEP_ALL, recorded: null, revisits: [], ticked: []
+    breakouts: [], inference: [], keep: o.keep ?? KEEP_ALL, recorded: null, revisits: [], ticked: [], screenModel: null
   };
 }
 /** Creates the note item first, then its recording, in one transaction. */
@@ -170,14 +172,14 @@ export interface HeldRoom { id: string; name: string; people: Speaker[]; from: n
 /**
  * The recording is complete: its live transcript moves into the note, the main room's lines into the transcript and
  * each breakout room's into that room's section (`rooms`), with the stretches nothing was captured in, what was on
- * shared screens (`shown`, the call's frames as screen moments) and the follow-ups ticked during the call. Everyone
+ * and the model the organizer chose to read shared screens (`screenModel`), and the follow-ups ticked during the call. Everyone
  * invited gets the note, and it's queued for the notes service (modules/writer.ts), which writes each room's notes too.
  * Runs in the stopping transaction, once the recording has stopped. A call set not to keep its recording loses its audio
  * here, after everything worked out from it (where lines fall, and the seconds billed) is in the note. Returns the
  * objects to delete once that transaction commits.
  */
 export async function finishRecording(o: Owner, db: Db, noteId: string, durationSeconds: number, breakouts: HeldRooms[] = [],
-  speakerOf?: ((identity: string) => Speaker | undefined) | undefined, gaps: CaptureGap[] = [], shown: ScreenMoment[] = [], rooms: HeldRoom[] = [], ticked: Ticked[] = [], workedOn: WorkedDocument[] = []): Promise<string[]> {
+  speakerOf?: ((identity: string) => Speaker | undefined) | undefined, gaps: CaptureGap[] = [], rooms: HeldRoom[] = [], ticked: Ticked[] = [], workedOn: WorkedDocument[] = [], screenModel: string | null = null): Promise<string[]> {
   const { recordingId } = (await getItem(o, db, 'note', noteId, NoteManifest, 'Those notes')).manifest;
   const audio = await segments(o, recordingId, db);
   // Each line stays inside its own segment of the recording, so nothing said before a pause comes after it.
@@ -190,7 +192,7 @@ export async function finishRecording(o: Owner, db: Db, noteId: string, duration
   }));
   const heardBy = await transcripts.heardBy(o, db, noteId);
   const next = await updateNote(o, db, noteId, (n) => ({
-    ...n, status: 'pending', endedAt: new Date().toISOString(), duration: Math.max(n.duration, durationSeconds), breakouts, gaps, screens: shown,
+    ...n, status: 'pending', endedAt: new Date().toISOString(), duration: Math.max(n.duration, durationSeconds), breakouts, gaps, screenModel,
     recorded: audio.reduce((total, s) => total + s.seconds, 0),
     // In a call, each line keeps whoever said it; a room recording names nobody.
     transcript: transcripts.spoken(heard, speakerOf), rooms: sections,
@@ -201,7 +203,7 @@ export async function finishRecording(o: Owner, db: Db, noteId: string, duration
   await personal.dropUnheld(db, o.ownerId, noteId);
   await queueNotes(o, db, noteId, next.recordingId);
   nlog.info('notes job queued', {
-    noteId, recordingId: next.recordingId, seconds: durationSeconds, lines: heard.length, screens: shown.length, invited: next.invited.length,
+    noteId, recordingId: next.recordingId, seconds: durationSeconds, lines: heard.length, invited: next.invited.length,
     rooms: sections.length, roomLines: sections.reduce((n, r) => n + r.transcript.length, 0), ticked: ticked.length
   });
   return next.keep.recording ? [] : purgeAudio(o, db, next.recordingId);
@@ -432,7 +434,8 @@ export async function get(o: Owner, id: string): Promise<Note> {
   return {
     ...summaryOf(l, organizer, who), recipients: who, summary: m.summary, decisions, questions, actions, chapters: m.chapters,
     gaps: m.gaps, screens: m.screens, transcript: read.transcript, rooms, additions: await additions.of(l, o.ownerId), writtenAt: m.writtenAt, writingAgain: m.status === 'ready' && !!(await jobOf(l.owner, l.owner.pool, id)),
-    suggestedQuestions: m.suggestedQuestions, audio: await segments(l.owner, m.recordingId), kept: m.keep, inference: m.inference, workedOn: await workedOnFor(o, m.workedOn), ...(seriesId ? { seriesId } : {})
+    suggestedQuestions: m.suggestedQuestions, audio: await segments(l.owner, m.recordingId), kept: m.keep, inference: m.inference, workedOn: await workedOnFor(o, m.workedOn),
+    shares: await screens.shareIntervals(l.owner, m.recordingId), screenModel: m.screenModel, ...(seriesId ? { seriesId } : {})
   };
 }
 /** A note's notes job while its notes are queued or being written, whichever of its revisions it was queued for. */
@@ -444,6 +447,19 @@ async function jobOf(o: Owner, db: Db, noteId: string) {
 export async function audioSource(o: Owner, id: string): Promise<{ owner: Owner; recordingId: string }> {
   const l = await locate(o, id);
   return { owner: l.owner, recordingId: l.note.manifest.recordingId };
+}
+/**
+ * The vault and recording to replay a kept share's video in one segment from, after the same access check as the
+ * audio: not found unless the note's recording has that video. One query besides opening the note, for every range.
+ */
+export async function videoAccess(o: Owner, id: string, shareId: string, segment: number): Promise<{ owner: Owner; recordingId: string }> {
+  const l = await locate(o, id);
+  const recordingId = l.note.manifest.recordingId;
+  const has = await maybeOne(l.owner.pool, z.object({ chunk: z.number() }), `SELECT v.chunk FROM screen_videos v
+    JOIN screen_shares s ON s.owner_id = v.owner_id AND s.recording_id = v.recording_id AND s.share_id = v.share_id
+    WHERE v.owner_id = $1 AND v.recording_id = $2 AND v.share_id = $3 AND v.segment = $4 AND v.chunk = 0 AND s.keep`, [l.owner.ownerId, recordingId, shareId, segment]);
+  if (!has) throw notFound('That shared screen’s video', { noteId: id, segment });
+  return { owner: l.owner, recordingId };
 }
 /** One of a note's shared-screen frames, decrypted, for anyone who has the note: only frames the note shows. */
 export async function screenImage(o: Owner, id: string, frameId: string): Promise<Uint8Array> {
@@ -473,12 +489,14 @@ export async function progress(o: Owner, id: string): Promise<NoteProgress> {
       : job?.state === 'waiting' ? 'Waiting for the notes model. The notes are written as soon as it’s verified and answering'
         : job && job.attempt > 0 ? 'The notes service is busy. Trying again shortly'
           : 'Queued for the notes service';
+  const video = stopped ? await screens.videoReady(owner, m.recordingId) : null;
   return {
     noteId: id, title: m.title, ready: done,
     steps: [
       { label: m.kind === 'room' ? 'Recording stopped' : 'Call ended', done: stopped },
       { label: audio, done: stopped },
       { label: transcript, done: stopped },
+      ...(video === null ? [] : [{ label: video || done ? 'Shared screens ready to replay' : 'Getting shared screens ready to replay', done: video || done }]),
       { label: done ? 'Notes written' : writing, done }
     ]
   };
@@ -966,7 +984,7 @@ export async function correctLine(o: Owner, noteId: string, lineId: string, patc
  * confirmed or changed by the time they're written stays (modules/writer.ts). Asking again while they're queued or
  * being written changes nothing. Call writer.kick after it.
  */
-export async function rewrite(o: Owner, noteId: string): Promise<Note> {
+export async function rewrite(o: Owner, noteId: string, opts: { screenModel?: string | null | undefined } = {}): Promise<Note> {
   const l = await locate(o, noteId);
   const m = l.note.manifest;
   if (!l.mine) throw new ForbiddenError('Only the organizer can have the notes written again.', { context: { noteId } });
@@ -980,6 +998,11 @@ export async function rewrite(o: Owner, noteId: string): Promise<Note> {
       // Holding the note while its job is looked for, so two asks at once queue one job.
       await lockItem(o, c, noteId);
       if (await jobOf(o, c, noteId)) return false;
+      // Another model for shared screens: the notes keep it, and their frames are read again with it.
+      if (opts.screenModel !== undefined) {
+        const screenModel = opts.screenModel;
+        await updateNote(o, c, noteId, (n) => ({ ...n, screenModel }));
+      }
       await queueNotes(o, c, noteId, m.recordingId);
       return true;
     });
@@ -1053,7 +1076,7 @@ export async function remove(o: Owner, id: string): Promise<void> {
 
 /**
  * Deletes one of this owner's notes for good, in the caller's transaction: every revision, its
- * recording and pieces, its shared-screen frames, its jobs, everyone's access, everyone's own notes on
+ * recording and pieces, its shared screens' video and frames, its jobs, everyone's access, everyone's own notes on
  * it and what they added to it (both cascade from its row), the link from its meeting, and this
  * owner's operation receipts (which may hold copies of responses); stored bytes go
  * down to match. Returns the audio and frame objects, for the caller to delete once the transaction
@@ -1065,7 +1088,8 @@ export async function deleteOwnNote(o: Owner, db: Db, id: string): Promise<{ ids
   await lockItem(o, db, id);
   const audio = await noteObjects(o, db, id);
   const shown = await screens.frameObjects(o, db, id);
-  const bytes = audio.bytes + shown.bytes;
+  const video = await screens.videoObjects(o, db, id);
+  const bytes = audio.bytes + shown.bytes + video.bytes;
   await exec(db, `DELETE FROM content_jobs WHERE owner_id = $1 AND revision_id IN (SELECT revision_id FROM revisions WHERE owner_id = $1 AND item_id = $2)`, [o.ownerId, id]);
   for (const m of (await listItems(o, db, 'meeting', MeetingManifest)).filter((x) => x.manifest.noteId === id)) {
     const { noteId: _drop, ...rest } = m.manifest;
@@ -1075,5 +1099,5 @@ export async function deleteOwnNote(o: Owner, db: Db, id: string): Promise<{ ids
   await exec(db, 'DELETE FROM items WHERE owner_id = $1 AND item_id = $2', [o.ownerId, id]);
   if (bytes) await exec(db, 'UPDATE owners SET stored_bytes = greatest(0, stored_bytes - $2), version = version + 1 WHERE owner_id = $1', [o.ownerId, bytes]);
   await exec(db, 'DELETE FROM operations WHERE owner_id = $1', [o.ownerId]);
-  return { ids: [...audio.ids, ...shown.ids], frames: shown.ids.length };
+  return { ids: [...audio.ids, ...shown.ids, ...video.ids], frames: shown.ids.length };
 }

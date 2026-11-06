@@ -1,7 +1,8 @@
 /*
- * NEAR AI Cloud (I01): speech to text for the live transcript, and the model that writes notes,
- * answers questions about them and reads frames of shared screens. This module and evidence.ts are the only code that talks to NEAR AI, and
- * this is the only one that sends it anything with content. Nothing leaves here except sealed to a model
+ * NEAR AI Cloud (I01): speech to text for the live transcript, the model that writes notes and answers questions
+ * about them, and the model chosen to read frames of shared screens. This module and evidence.ts are the only code
+ * that talks to NEAR AI besides modules/models.ts, which only reads its public lists of models; this is the only one
+ * that sends it anything with content. Nothing leaves here except sealed to a model
  * whose evidence checked out (evidence.ts):
  *
  *  - every request, speech and chat alike, goes by Oblivious HTTP (ohttp.ts) to the model's own endpoint
@@ -29,7 +30,7 @@ export interface Inference { configured: boolean; baseUrl: string }
 export const inference = (cfg: Config): Inference => ({ configured: !!cfg.NEAR_AI_API_KEY, baseUrl: cfg.NEAR_AI_BASE_URL });
 
 type Ready = Config & { NEAR_AI_API_KEY: string };
-const ready = (cfg: Config): cfg is Ready => !!cfg.NEAR_AI_API_KEY;
+export const ready = (cfg: Config): cfg is Ready => !!cfg.NEAR_AI_API_KEY;
 const notConnected = (what: string) => new UnavailableError('Alcove’s notes service isn’t connected on this server.', { context: { what } });
 
 /** The model didn't open a request sealed to the key it vouched for (it rotated, or another instance answered): verify again and retry once. */
@@ -326,20 +327,24 @@ function jsonIn(text: string): unknown {
   try { return JSON.parse(text.slice(from, to + 1)); } catch { return null; }
 }
 
+/** A chat model and its own endpoint (modules/models.ts). The notes model unless said otherwise. */
+export interface ChatModel { model: string; url: string }
+
 /**
- * Asks the notes model for one JSON object, sealed to its verified key at its own endpoint, and returns it
- * unparsed for the caller's schema, with the verification it went to.
+ * Asks a chat model (the notes model, or `o.via`) for one JSON object, sealed to its verified key at its own endpoint,
+ * and returns it unparsed for the caller's schema, with the verification it went to.
  */
-export async function complete(cfg: Config, messages: Message[], o: { what: string; maxTokens: number; timeoutMs?: number }): Promise<{ json: unknown; evidence: InferenceEvidence }> {
+export async function complete(cfg: Config, messages: Message[], o: { what: string; maxTokens: number; timeoutMs?: number; via?: ChatModel | undefined }): Promise<{ json: unknown; evidence: InferenceEvidence }> {
   if (!ready(cfg)) throw notConnected(o.what);
-  const model = cfg.NEAR_AI_NOTES_MODEL;
+  const model = o.via?.model ?? cfg.NEAR_AI_NOTES_MODEL;
+  const endpoint = o.via?.url ?? cfg.NEAR_AI_NOTES_URL;
   // Thinking out loud first takes the model a minute on a long call and isn't needed for notes.
   const body = utf8(JSON.stringify({
     model, messages, temperature: 0.2, max_tokens: o.maxTokens, response_format: { type: 'json_object' }, chat_template_kwargs: { enable_thinking: false }, stream: false
   }));
   return withVerified(cfg, model, 'notes', async (v) => {
     const t0 = performance.now();
-    const reply = await sealed(cfg, v, cfg.NEAR_AI_NOTES_URL, { path: '/v1/chat/completions', type: 'application/json', body, timeoutMs: o.timeoutMs ?? 90_000, what: o.what });
+    const reply = await sealed(cfg, v, endpoint, { path: '/v1/chat/completions', type: 'application/json', body, timeoutMs: o.timeoutMs ?? 90_000, what: o.what });
     const ms = Math.round(performance.now() - t0);
     if (reply.status !== 200) throw statusError(reply.status, { what: o.what, ms });
     const r = Chat.safeParse(parsed(reply.body));

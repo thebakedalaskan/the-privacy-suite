@@ -14,6 +14,7 @@ import { startFakeDstack } from './testing/fake-dstack';
 import { PNG, type GoogleUser, type Spoil } from './testing/fake-google';
 import { speechWav, startFakeNear, type Tamper } from './testing/fake-near';
 import { ORIGIN, cookieFetch, startHarness, type Browser, type Harness } from './testing/harness';
+import { cut, recordedWebm } from './testing/video';
 
 let h: Harness;
 beforeAll(async () => { h = await startHarness(); });
@@ -240,7 +241,7 @@ describe('signing in', () => {
     const defaults = {
       notesDefault: 'on', notesLanguage: 'call', summaryLength: 'short', addToCalendar: true, showOtherMeetings: true, recordOffline: true,
       notifications: { beforeCall: 5, notesReady: true, sharedWithYou: true, notesRequested: true, followUpDue: false },
-      pinned: [], groups: []
+      pinned: [], groups: [], screenModel: null
     };
     expect(await api.account.preferences()).toEqual(defaults);
     const patched = await api.account.updatePreferences({
@@ -935,6 +936,33 @@ describe('calls with notes', () => {
       expect(short.status).toBe(403);
       expect(await short.json()).toMatchObject({ code: 'key-unavailable' });
     });
+  });
+
+  it('puts a screen its presenter shares into the notes: recorded in pieces, replayed with the audio, and read where it was talked about', async () => {
+    const { api, fetch: own } = await account();
+    const call = await api.calls.join((await api.calls.startNow({ notes: 'on' })).code, { mic: true, cam: false });
+    for (let seq = 0; seq < 4; seq++) await call.appendAudio(piece(audioBytes(`talk-${seq}`), 0, seq));
+    // They say yes to "Include this share in the notes?", and their browser sends the share's video every five seconds.
+    const shared = await call.startShare({ notes: true });
+    expect(shared.keep).toBe(true);
+    expect(call.getSnapshot()).toMatchObject({ shares: [{ id: shared.share, keep: true }], capture: { screen: { mode: 'on' } } });
+    const video = cut(await recordedWebm(20, { size: '320x180' }), 4);
+    for (const [seq, data] of video.entries()) {
+      await call.appendScreen({ data: new Blob([data]), share: shared.share, segment: 0, seq, at: seq * 5, durationMs: 5000, mimeType: 'video/webm;codecs=vp8' });
+    }
+    await call.transcribe(speech('Let me share my screen. // As you can see the chart, sales doubled.', 0, 3), call.ticket.identity);
+    await call.shareEnded(shared.share);
+    const noteId = (await ended(call)).pendingNoteId ?? '';
+    await written(api, noteId);
+
+    const note = await api.notes.get(noteId);
+    expect(note.shares).toEqual([expect.objectContaining({ id: shared.share, at: 0, until: 20, segments: [{ segment: 0, at: 0, until: 20 }] })]);
+    const replay = await own(api.notes.screenVideoUrl(noteId, shared.share, 0), { headers: { range: 'bytes=0-99' } });
+    expect([replay.status, replay.headers.get('content-type'), (await replay.arrayBuffer()).byteLength]).toEqual([206, 'video/webm', 100]);
+    // A frame of the share as it began goes beside the line said then, and the one talked about beside its line.
+    const lines = note.transcript ?? [];
+    expect(note.screens.map((m) => [m.share, m.at, m.line])).toEqual([[shared.share, 0, lines[0]?.id], [shared.share, 5, lines[1]?.id]]);
+    expect(note.screens.find((m) => m.cue === 'As you can see the chart, sales doubled.')).toMatchObject({ at: 5, relevance: 'key' });
   });
 
   it('joins a call without notes and leaves no note behind', async () => {
@@ -2722,6 +2750,9 @@ describe('deleting an account', () => {
     const live = await b.api.calls.join((await b.api.calls.startNow({ notes: 'on', guests: [kofi.session.user.email] })).code, { mic: true, cam: false });
     await live.appendAudio(piece(audioBytes('leaving-live'), 0, 0));
     await live.transcribe(speech('We are still talking.', 0, 0), live.ticket.identity);
+    // She shares her screen into the notes, and her browser has sent a piece of its video.
+    const sharing = await live.startShare({ notes: true });
+    await live.appendScreen({ data: new Blob([audioBytes('leaving-screen')]), share: sharing.share, segment: 0, seq: 0, at: 0, durationMs: 5000, mimeType: 'video/webm;codecs=vp8' });
     expect(await live.translate(live.getSnapshot().transcript.map((l) => l.id), 'de')).toHaveLength(1);
     // Its shared live notes, which she was reading.
     const reading = live.watchNotes();
@@ -2753,22 +2784,22 @@ describe('deleting an account', () => {
     const tables = (await h.pool.query<{ table_name: string }>("SELECT table_name FROM information_schema.columns WHERE table_schema = 'public' AND column_name = 'owner_id' ORDER BY table_name")).rows.map((r) => r.table_name);
     expect(tables).toEqual([
       'billing_accounts', 'call_codes', 'call_mls', 'call_moves', 'call_notes', 'call_rings', 'calls', 'content_jobs', 'document_access', 'document_clients', 'document_snapshots', 'document_updates', 'document_version_parts', 'document_versions', 'documents', 'identities', 'items', 'media_upload_days', 'meeting_access', 'note_access', 'note_additions',
-      'object_gc', 'operations', 'owners', 'personal_notes', 'presenter_notes', 'recording_pieces', 'recordings', 'revisions', 'screen_frames', 'sessions', 'transcript_clips', 'transcript_translations', 'workspace_authors',
+      'object_gc', 'operations', 'owners', 'personal_notes', 'presenter_notes', 'recording_pieces', 'recordings', 'revisions', 'screen_frames', 'screen_pieces', 'screen_shares', 'screen_videos', 'sessions', 'transcript_clips', 'transcript_translations', 'workspace_authors',
       'workspace_media', 'workspace_media_pieces', 'workspace_media_uses', 'workspace_members', 'workspaces'
     ]);
     const counts = async () => Object.fromEntries(await Promise.all(tables.map(async (t) => [t, (await h.pool.query<{ n: number }>(`SELECT count(*)::int AS n FROM ${t} WHERE owner_id = $1`, [ownerId])).rows[0]?.n ?? -1] as const)));
     const before = await counts();
-    // Shared screens need someone sharing in a LiveKit room: deleting an account's frames is in screens.integration.test.ts.
+    // Frames and joined video come from a real video once the notes are written: deleting them with a note is in screens.integration.test.ts.
     // A workspace is an owner of its own, so an account has no rows there under its own ID: workspaces.integration.test.ts deletes those, and media.integration.test.ts what's in them.
-    const notAnAccounts = new Set(['object_gc', 'screen_frames', 'workspaces', 'workspace_members', 'workspace_authors', 'documents', 'document_access', 'document_clients', 'document_updates', 'document_snapshots', 'document_version_parts', 'document_versions', 'workspace_media', 'workspace_media_pieces', 'workspace_media_uses']);
+    const notAnAccounts = new Set(['object_gc', 'screen_frames', 'screen_videos', 'workspaces', 'workspace_members', 'workspace_authors', 'documents', 'document_access', 'document_clients', 'document_updates', 'document_snapshots', 'document_version_parts', 'document_versions', 'workspace_media', 'workspace_media_pieces', 'workspace_media_uses']);
     for (const t of tables) if (!notAnAccounts.has(t)) expect(before[t], t).toBeGreaterThan(0);
     expect((await h.pool.query<{ kind: string }>('SELECT DISTINCT kind FROM items WHERE owner_id = $1 ORDER BY kind', [ownerId])).rows.map((r) => r.kind)).toEqual(['connection', 'meeting', 'note', 'profile']);
     const [identity] = (await h.pool.query<{ email_index: Buffer }>('SELECT email_index FROM identities WHERE owner_id = $1', [ownerId])).rows;
     if (!identity) throw new Error('Lena has no sign-in identity');
     const givenToHer = async () => (await h.pool.query<{ n: number }>('SELECT count(*)::int AS n FROM note_access WHERE email_index = $1', [identity.email_index])).rows[0]?.n;
     expect(await givenToHer()).toBe(2);
-    const objects = (await h.pool.query<{ object_id: string }>('SELECT object_id FROM recording_pieces WHERE owner_id = $1', [ownerId])).rows.map((r) => r.object_id);
-    expect(objects).toHaveLength(3);
+    const objects = (await h.pool.query<{ object_id: string }>('SELECT object_id FROM recording_pieces WHERE owner_id = $1 UNION ALL SELECT object_id FROM screen_pieces WHERE owner_id = $1', [ownerId])).rows.map((r) => r.object_id);
+    expect(objects).toHaveLength(4);
 
     // Her call next week is on her Google calendar, and she has never asked Google to revoke anything.
     expect(h.google.calendar(lena.sub).map((e) => e.summary)).toEqual(['Next week']);
@@ -2798,7 +2829,7 @@ describe('deleting an account', () => {
     expect(h.google.calls.slice(googleCalls).filter((c) => c.method === 'DELETE')).toEqual([{ method: 'DELETE', path: expect.stringContaining('/events/'), sendUpdates: 'all' }]);
     expect(h.google.revocations()).toEqual(expect.arrayContaining(lenaToken));
     expect(lenaToken.filter((t) => h.google.honours(t))).toEqual([]);
-    expect(logLines().find((l) => l.msg === 'account deleted' && l['ownerId'] === ownerId)).toMatchObject({ calendarCancelled: 1, calendarKept: 0, calendarNotCancelled: 0, objects: 3 });
+    expect(logLines().find((l) => l.msg === 'account deleted' && l['ownerId'] === ownerId)).toMatchObject({ calendarCancelled: 1, calendarKept: 0, calendarNotCancelled: 0, objects: 4 });
 
     // She's signed out in every browser, and her call is gone with her: its LiveKit room is closed, which takes everyone out.
     expect((await h.deps.livekit.existingRooms([live.ticket.roomName])).size).toBe(0);
@@ -3049,6 +3080,9 @@ describe('privacy at rest', () => {
     const started = await c.api.calls.startNow({ notes: 'on', guests: [scribeEmail, 'canary-rung@canary.example'] });
     const call = await c.api.calls.join(started.code, { mic: true, cam: true });
     await call.appendAudio(piece(audioBytes('CANARY-AUDIO-RAW'), 0, 0));
+    // Canary Person shares their screen for the notes: its video (titled with a canary) is sealed, and so is their name.
+    const shared = await call.startShare({ notes: true });
+    await call.appendScreen({ data: new Blob([await recordedWebm(5, { size: '320x180', title: 'CANARY-VIDEO deck' })]), share: shared.share, segment: 0, seq: 0, at: 0, durationMs: 5000, mimeType: 'video/webm;codecs=vp8' });
     await call.transcribe(speech('CANARY-SPEECH the merger closes on Friday.', 0, 0), call.ticket.identity);
     expect(call.getSnapshot().transcript.map((l) => l.text)).toEqual(['CANARY-SPEECH the merger closes on Friday.']);
     // The call's shared live notes are sealed rows too, and so is who ticked what.
@@ -3085,6 +3119,9 @@ describe('privacy at rest', () => {
     await call.askSoFar('What closes on Friday? CANARY-ASKED', { kind: 'all' });
     await call.catchUpWindow();
     await call.moment(call.getSnapshot().transcript[0]?.id ?? '');
+    // What's said about the shared screen picks a frame of it, and goes with it, sealed, to the model that reads it.
+    await call.transcribe(speech('CANARY-CUE as you can see the chart.', 0, 2, 2000), call.ticket.identity);
+    await call.shareEnded(shared.share);
     const translations = String((await h.pool.query(`SELECT string_agg(row_to_json(x)::text, ' ') AS all FROM transcript_translations x`)).rows[0]?.all ?? '');
     expect(translations).not.toBe('');
     const callRows = String((await h.pool.query(`SELECT string_agg(row_to_json(x)::text, ' ') AS all FROM calls x`)).rows[0]?.all ?? '');
@@ -3108,6 +3145,8 @@ describe('privacy at rest', () => {
     await written(c.api, ended?.pendingNoteId ?? '');
     const settledNote = await c.api.notes.get(ended?.pendingNoteId ?? '');
     expect(settledNote.rooms.map((r) => r.transcript.map((l) => l.text))).toEqual([['CANARY-ROOMTALK the merger moves to Monday.'], []]);
+    expect(settledNote.shares.map((x) => x.label)).toEqual(['Canary Person’s screen']);
+    expect(settledNote.screens.find((m) => m.cue === 'CANARY-CUE as you can see the chart.')).toMatchObject({ at: 2, relevance: 'key' });
     const own = (await c.api.notes.personal(ended?.pendingNoteId ?? '').add({ kind: 'answer', question: 'CANARY-OWN-ASKED who signs?', answer: 'CANARY-OWN-ANSWER Priya signs.', points: [] })).entries[0];
     const addition = await c.api.notes.previewAddition(ended?.pendingNoteId ?? '', own?.id ?? '');
     expect(addition.text).toBe('CANARY-OWN-WORDS for nobody else');
@@ -3234,7 +3273,8 @@ describe('privacy at rest', () => {
       'CANARY-PROPOSAL', 'CANARY-ROOMPROPOSAL', 'CANARY-FOLLOWUP', 'CANARY-DUE', 'CANARY-REWORD', 'needs a vote', 'brief the board', 'two votes',
       'CANARY-WORKSPACE', 'CANARY-WSFOLDER', 'CANARY-WSDOC', 'CANARY-WSBOARD', 'CANARY-WSRENAMED', 'CANARY-WSREFUSED', 'canary-ws-member', 'canary-ws-shared',
       'CANARY-BOARDCALL', 'CANARY-BOARDGUEST',
-      'CANARY-MEDIA-NAME', 'CANARY-MEDIA-BYTES', 'CANARY-MEDIA-GONE', 'CANARY-MEDIA-DELETED'
+      'CANARY-MEDIA-NAME', 'CANARY-MEDIA-BYTES', 'CANARY-MEDIA-GONE', 'CANARY-MEDIA-DELETED',
+      'CANARY-CUE', 'as you can see the chart', 'CANARY-VIDEO', 'Person’s screen'
     ];
     for (const canary of canaries) for (const enc of encodings(canary)) expect(rowsText.includes(enc), `${canary} as ${enc}`).toBe(false);
     // An answer is one short word, so it has a check of its own, in the only rows that hold one.
@@ -3260,6 +3300,8 @@ describe('privacy at rest', () => {
     // to the verified models, never readable, though the models themselves read them (the fake's prompts).
     expect(h.near.prompts.some((p) => p.includes('CANARY-SPEECH'))).toBe(true);
     expect(h.near.prompts.some((p) => p.includes('CANARY-ROOMTALK'))).toBe(true);
+    expect(h.near.prompts.some((p) => p.includes('Cue: CANARY-CUE as you can see the chart.'))).toBe(true);
+    expect(h.near.prompts.some((p) => p.includes('Share 1: Canary Person’s screen'))).toBe(true);
     const wire = Buffer.concat(h.near.received.map((r) => r.body));
     for (const canary of [...canaries, 'What closes on Friday']) for (const enc of encodings(canary)) expect(wire.includes(Buffer.from(enc)), `${canary} as ${enc} on the wire to NEAR AI`).toBe(false);
     expect(h.near.calls.filter((x) => x.encryption === 'none')).toEqual([]);
