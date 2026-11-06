@@ -538,8 +538,8 @@ where what was said points at it ([Notes and inference › Shared screens](notes
 Code: `apps/web/src/features/call/screenRecord.ts` (the recorder), `SharePicker.tsx` (the question),
 `apps/api/src/modules/screens.ts` (storage, video and analysis), `apps/api/src/ffmpeg.ts`.
 
-- **Asking the presenter.** While notes are on or paused, and the call's `readScreens` choice (**Read shared
-  screens** when it's scheduled, on by default; `CaptureState.readScreens`) lets shares go in the notes, the share
+- **Asking the presenter.** While notes are on or paused, and the call's `allowScreens` choice (**Read shared
+  screens** when it's scheduled, on by default; `CaptureState.allowScreens`) lets shares go in the notes, the share
   picker asks **Include this share in the
   notes?**, and its share button waits for **Yes** or **No**. It's asked every time the picker opens (**Change**
   included: something else shared is a new share), and never with notes off or in a breakout room, where nothing
@@ -578,24 +578,29 @@ Code: `apps/web/src/features/call/screenRecord.ts` (the recorder), `SharePicker.
   (`video/webm` or `video/mp4`, codecs allowed) and its place in `x-alcove-segment`, `x-alcove-seq`,
   `x-alcove-at-ms` and `x-alcove-duration-ms`. A piece over 4 MiB (`MAX_VIDEO_PIECE_BYTES`) is refused from its
   `content-length` before it's read; 60 pieces a minute per person (`503` past that). Then, in order: the sender
-  must be in the call (`403`); the share must be one the call knows (`404`) and the sender's own (`403`); it must
+  must have been let in (`403`; someone who has left can still send their share's tail); the share must be one the
+  call knows (`404`) and the sender's own (`403`); it must
   have a row with the recording (`403`: started before notes were ever on). A piece already stored at that place
   is a retry and is answered as stored, whatever has happened since. Otherwise the share must still be kept (`403`:
   the presenter said no, or notes went off), the capture gate's `screen` path must allow it (`409` while notes are
-  paused or off), and the piece must be in the recording's current segment (`409`: from an earlier one). A
-  different piece at a place already stored is `409` too, never dropped as if it were stored. The answer is the
-  call's state.
+  paused or off), the piece must be in the recording's current segment (`409`: from an earlier one), and LiveKit
+  must list a screen the sender is sharing in the call's room (`403`; what LiveKit said is kept for 10 seconds, and
+  `503` when LiveKit can't be asked). A share's pieces together can't be more than 250 KB for each second since it
+  started, plus 30 seconds' worth (about five times what a browser records), so nobody fills the organizer's storage
+  under one share (`409`). A different piece at a place already stored is `409` too, never dropped as if it were
+  stored. The answer is the call's state.
 - **The tail.** A share that has ended, or whose call has, still takes pieces of the segment it ended in for 20
   seconds after it ended (`SHARE_TAIL_MS`; its end in the call, or when the recording stopped if that's earlier),
-  since the browser hands its last piece over as it stops; after that it's `404`. Once the call has ended the
-  presenter's pass still works for this request alone (only the organizer's works for anything else), and the
-  answer says only that the call has ended. The notes worker waits until 20 seconds after the last kept share
+  since the browser hands its last piece over as it stops, as the presenter leaves, or as the call ends; after that
+  it's `404`. A presenter who has just left sends it too, and once the call has ended their pass still works for this
+  request alone (only the organizer's works for anything else); either way the answer says only that they're out. The notes worker waits until 20 seconds after the last kept share
   ended before it joins the video. A piece is stored holding its share's row (`FOR SHARE`), and refused (`404`,
   its object deleted) once that share's video in its segment is joined; joining locks the row (`FOR UPDATE`) and
   counts the pieces again, and joins once more if more came in meanwhile. The browser drops a piece refused with `409`, and stops recording a
-  share refused with `403` or `404`. What this proves is that the sender is the presenter who started that share
-  and said it goes in the notes: the API can't see what's on it, so the video is the presenter's browser's word.
-  A modified browser could send any video under its own kept share, which is no more than it could show everyone.
+  share refused with `403` or `404`. What this proves is that the sender is the presenter who started that share,
+  said it goes in the notes, and has a screen up in the call: the API can't see what's on it, so the video is the
+  presenter's browser's word. A modified browser could send any video under its own kept share while it shares a
+  screen, which is no more than it could show everyone, and no more of it than the share's byte budget.
 - **Sealed as it arrives.** Each piece is sealed under the recording's key, like audio (record kind
   `screen-video`, binding the recording, the share, the segment, the piece and the object), written under a random
   object name, read back and checked, and only then recorded in `screen_pieces` with its place, length and type.

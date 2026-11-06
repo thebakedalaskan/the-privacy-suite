@@ -7,7 +7,7 @@
  * window picked by mistake is never sent.
  *
  * Each recording is one share in one segment of the call's recording: one continuous WebM stream, numbered from piece
- * 0, placed on the same timeline as the call's audio (seconds from the segment's start, as this browser saw it begin).
+ * 0, placed on the same timeline as the call's audio (seconds from the segment's start, as the call's server began it).
  * Pausing notes stops it and drops what wasn't sent; resuming starts a new segment, so a new recording. A share ending
  * sends what was recorded before the call is told it ended. Nothing about what's on the screen is logged: only counts,
  * sizes and timings.
@@ -42,7 +42,7 @@ export interface ScreenTake {
   /** When this share started, from performance.now(): nothing of it is sent until it has been up FIRST_AFTER_MS. */
   since: number;
   segment: number;
-  /** When this browser saw the segment begin, from performance.now(): pieces are placed from there, as the audio is. */
+  /** When the call's server began the segment, on this browser's clock (performance.now()): pieces are placed from there, as the audio is. */
   origin: number;
 }
 
@@ -60,6 +60,8 @@ export class ScreenRecorder {
   private gen = 0;
   /** Shares the call refused (not kept, or over): nothing more of them is recorded. */
   private refused = new Set<string>();
+  /** Runs (`share:segment`) whose first piece, the one with the WebM header, was lost for good: the server can't join the rest, so they aren't sent. */
+  private headless = new Set<string>();
 
   constructor(private readonly upload: (p: ScreenPiece) => Promise<void>, private readonly onProblem: (message: string | null) => void) {}
 
@@ -130,7 +132,7 @@ export class ScreenRecorder {
     const startMs = Math.max(0, performance.now() - t.origin);
     const grace: Grace = { held: [], released: false, dropped: false, timer: null };
     const enqueue = (p: ScreenPiece) => {
-      this.queue = this.queue.then(() => (gen === this.gen && !this.refused.has(share) ? this.send(p, gen) : undefined));
+      this.queue = this.queue.then(() => (gen === this.gen && !this.refused.has(share) && !this.headless.has(`${share}:${segment}`) ? this.send(p, gen) : undefined));
     };
     let seq = 0;
     let recorded = 0;
@@ -182,6 +184,13 @@ export class ScreenRecorder {
     });
   }
 
+  /** The first piece of a run is lost for good: nothing later in it can be joined, so the rest of it isn't sent. */
+  private loseRun(p: ScreenPiece): void {
+    this.headless.add(`${p.share}:${p.segment}`);
+    slog.warn('first piece of a shared screen lost; the rest of its recording is dropped', { segment: p.segment });
+    if (this.run?.share === p.share && this.run.segment === p.segment) void this.finish();
+  }
+
   /**
    * Uploads one piece, in order. While the connection is down (or the server busy) it keeps trying for up to RETRY_MS,
    * so a short drop loses nothing. A refusal that trying again won't change gives up at once: notes paused or off, or
@@ -207,7 +216,11 @@ export class ScreenRecorder {
         }
         const waiting = (code === 'network' || code === 'unavailable' || code === 'unknown') && performance.now() - since < RETRY_MS;
         slog.at(waiting ? 'warn' : 'error', waiting ? 'shared screen piece upload failed; retrying' : 'shared screen piece lost', { err: e, code, ...where, attempt });
-        if (!waiting) { this.onProblem('Your shared screen couldn’t reach the notes. Check your connection.'); return; }
+        if (!waiting) {
+          this.onProblem('Your shared screen couldn’t reach the notes. Check your connection.');
+          if (p.seq === 0) this.loseRun(p);
+          return;
+        }
         await new Promise((r) => setTimeout(r, Math.min(5000, 500 * 2 ** attempt)));
       }
     }

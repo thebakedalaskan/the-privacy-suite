@@ -93,10 +93,10 @@ export const CaptureStateSchema = z.object({
    */
   screenModel: ModelIdSchema.nullable(),
   /**
-   * Whether the organizer lets shared screens go in these notes (the call's `readScreens` choice). Without it nobody is
+   * Whether the organizer lets shared screens go in these notes (the call's `allowScreens` choice). Without it nobody is
    * asked, and no share is kept.
    */
-  readScreens: z.boolean(),
+  allowScreens: z.boolean(),
   /** The stretches with nothing captured, oldest first; the last may still be going. Empty for people asking to join. */
   gaps: z.array(CaptureGapSchema),
   /** Open asks for notes. Empty for people asking to join. */

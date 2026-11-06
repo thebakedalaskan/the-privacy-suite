@@ -281,7 +281,7 @@ export function NotesSwitches({ notes, choices, onNotes, onChoices }: { notes: N
           <SwitchLine title="Keep the recording" sub={choices.keepRecording ? 'Play back any moment from the notes' : 'Deleted when the call ends'}
             control={<Switch checked={choices.keepRecording} label="Keep the recording" onChange={(keepRecording) => onChoices({ ...choices, keepRecording })} />} />
           <SwitchLine title="Read shared screens" sub="Whoever shares is asked whether it goes in the notes"
-            control={<Switch checked={choices.readScreens} label="Read shared screens" onChange={(readScreens) => onChoices({ ...choices, readScreens })} />} />
+            control={<Switch checked={choices.allowScreens} label="Read shared screens" onChange={(allowScreens) => onChoices({ ...choices, allowScreens })} />} />
           <p className="cf-sealed"><Icon name="sealed" size={14} />Written in confidential compute. Alcove can’t read them.</p>
         </>
       )}

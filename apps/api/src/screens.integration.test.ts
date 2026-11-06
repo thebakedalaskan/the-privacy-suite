@@ -14,6 +14,7 @@ import { joinDue } from './modules/screens';
 import { work } from './modules/writer';
 import { UNVERIFIED_VISION_MODEL, VISION_MODEL, speechWav } from './testing/fake-near';
 import { ORIGIN, startHarness, type Harness } from './testing/harness';
+import { disposeLiveKit, presentScreen, stopPresenting } from './testing/livekit';
 import { cut, recordedWebm, type Scene } from './testing/video';
 
 vi.setConfig({ testTimeout: 90_000 });
@@ -29,8 +30,8 @@ beforeAll(async () => {
   video = await recordedWebm(20);
   pieces = cut(video, 4);
 });
-afterAll(async () => { await h?.close(); });
-afterEach(() => { h.closeCalls(); });
+afterAll(async () => { await h?.close(); await disposeLiveKit(); });
+afterEach(async () => { await stopPresenting(); h.closeCalls(); });
 
 const code = (e: unknown) => (e instanceof AlcoveApiError ? e.code : 'not-an-api-error');
 const message = (e: unknown) => (e instanceof AlcoveApiError ? e.message : '');
@@ -76,6 +77,15 @@ const objectsOf = async (ownerId: string) => (await h.pool.query<{ object_id: st
 const exists = (objectId: string) => h.objects.get(objectId).then(() => 'kept', () => 'gone');
 async function* chunked(b: Uint8Array): AsyncGenerator<Uint8Array> { for (let i = 0; i < b.length; i += 65_536) yield b.subarray(i, i + 65_536); }
 const NOTES_FIRST = 'Turn on notes first: only then can a share go in them.';
+const onStage = new WeakSet<CallSession>();
+/**
+ * Starts a share the way a browser does: its screen up in the call's room first (LiveKit listing it is what the API
+ * checks a share's video against), then said to the call.
+ */
+async function sharing(call: CallSession, notes: boolean) {
+  if (!onStage.has(call)) { onStage.add(call); await presentScreen(call, h.deps.livekit); }
+  return call.startShare({ notes });
+}
 
 describe('shared screens kept for the notes', () => {
   it('keeps a share its presenter says goes in the notes, refuses pieces of one that doesn’t, and everyone sees which is which', async () => {
@@ -86,7 +96,7 @@ describe('shared screens kept for the notes', () => {
     await letIn(host, guest);
     expect(host.getSnapshot().capture.screen.mode).toBe('off');
 
-    const yes = await guest.startShare({ notes: true });
+    const yes = await sharing(guest, true);
     expect(yes).toEqual({ share: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/), keep: true });
     // Everyone sees the share, and that it's read for the notes; the capture panel says shared screens are on.
     let s = await settle(host, (x) => x.shares.length === 1);
@@ -115,7 +125,7 @@ describe('shared screens kept for the notes', () => {
     }
 
     // Sharing again ends the share before it: the new one, said no to, isn't recorded.
-    const no = await guest.startShare({ notes: false });
+    const no = await sharing(guest, false);
     expect(no.keep).toBe(false);
     s = await settle(host, (x) => x.shares.length === 1 && x.shares[0]?.id === no.share);
     expect(s.shares).toEqual([{ id: no.share, participant: guest.ticket.identity, keep: false }]);
@@ -130,13 +140,52 @@ describe('shared screens kept for the notes', () => {
     await host.leave();
   });
 
+  it('takes video only while LiveKit lists the presenter’s screen, and their last piece after they leave', async () => {
+    const org = await account(unique('organizer'));
+    const { code: c } = await org.api.calls.startNow({ notes: 'on' });
+    const host = await org.api.calls.join(c, { mic: true, cam: false });
+    const guest = await h.browser().api.calls.join(c, { mic: true, cam: false, name: 'Tomas' });
+    await letIn(host, guest);
+
+    // Said to the call, but never shared in its room: nothing of it goes in the notes, from a guest or the organizer.
+    const unseen = await guest.startShare({ notes: true });
+    expect(unseen.keep).toBe(true);
+    expect(await fails(guest.appendScreen(piece(unseen.share, 0)))).toEqual(['forbidden', 'That isn’t a screen you’re sharing in this call.']);
+    const hostUnseen = await host.startShare({ notes: true });
+    expect(await fails(host.appendScreen(piece(hostUnseen.share, 0)))).toEqual(['forbidden', 'That isn’t a screen you’re sharing in this call.']);
+    expect(await ownerRows('screen_pieces', org.session.ownerId)).toHaveLength(0);
+
+    // Shared in the room: taken. Leaving ends the share, and the piece their browser hands over as they go is taken too.
+    const shown = await sharing(guest, true);
+    for (let i = 0; i < 2; i++) await guest.appendScreen(piece(shown.share, i));
+    await guest.leave();
+    await settle(host, (x) => x.shares.every((sh) => sh.id !== shown.share));
+    await guest.appendScreen(piece(shown.share, 2));
+    expect(await ownerRows('screen_pieces', org.session.ownerId)).toHaveLength(3);
+    // Only the tail of that share: someone who left can't send a share that isn't theirs.
+    expect(await fails(guest.appendScreen(piece(hostUnseen.share, 1)))).toEqual(['forbidden', 'That isn’t a screen you’re sharing in this call.']);
+    await host.leave();
+  });
+
+  it('refuses video past what a share could have recorded in the time it has been up', async () => {
+    const org = await account(unique('organizer'));
+    const host = await org.api.calls.join((await org.api.calls.startNow({ notes: 'on' })).code, { mic: true, cam: false });
+    const { share } = await sharing(host, true);
+    // Just started, a share may hold 30 seconds' worth (7.5 MB): one big piece fits, a second doesn't.
+    const big = () => new Uint8Array(new ArrayBuffer(3_900_000)).fill(7);
+    await host.appendScreen(piece(share, 0, { data: big() }));
+    expect(await fails(host.appendScreen(piece(share, 1, { data: big() })))).toEqual(['conflict', 'This shared screen has sent more video than it could have recorded.']);
+    expect(await ownerRows('screen_pieces', org.session.ownerId)).toHaveLength(1);
+    await host.leave();
+  });
+
   it('holds pieces while notes are paused, carries a share into the next segment, and asks for notes before a share can go in them', async () => {
     const org = await account(unique('organizer'));
     const { code: c } = await org.api.calls.startNow({ notes: 'on' });
     const host = await org.api.calls.join(c, { mic: true, cam: false });
     await host.pause();
     // Paused: a share can still go in the notes, but nothing is taken until notes resume.
-    const share = await host.startShare({ notes: true });
+    const share = await sharing(host, true);
     expect(share.keep).toBe(true);
     expect(host.getSnapshot().capture.screen.mode).toBe('paused');
     expect(await fails(host.appendScreen(piece(share.share, 0)))).toEqual(['conflict', 'Notes are paused. Nothing is recorded, transcribed or sent to the AI until the organizer resumes.']);
@@ -151,7 +200,7 @@ describe('shared screens kept for the notes', () => {
     expect(host.getSnapshot().capture.screen.mode).toBe('off');
     expect(await fails(host.appendScreen(piece(share.share, 1, { segment })))).toEqual(['forbidden', 'That share doesn’t go in the notes.']);
     expect(await fails(host.startShare({ notes: true }))).toEqual(['conflict', NOTES_FIRST]);
-    expect((await host.startShare({ notes: false })).keep).toBe(false);
+    expect((await sharing(host, false)).keep).toBe(false);
     await host.leave();
   });
 
@@ -177,7 +226,7 @@ describe('shared screens kept for the notes', () => {
     const org = await account(unique('organizer'));
     const { code: c } = await org.api.calls.startNow({ notes: 'on' });
     const host = await org.api.calls.join(c, { mic: true, cam: false });
-    const share = await host.startShare({ notes: true });
+    const share = await sharing(host, true);
     for (let i = 0; i < 4; i++) await host.appendScreen(piece(share.share, i));
     await host.shareEnded(share.share);
     const pieceObjects = await objectsOf(org.session.ownerId);
@@ -248,7 +297,7 @@ describe('shared screens kept for the notes', () => {
   it('sends pieces only as raw video from the app, each no bigger than a piece can be', async () => {
     const org = await account(unique('organizer'));
     const host = await org.api.calls.join((await org.api.calls.startNow({ notes: 'on' })).code, { mic: true, cam: false });
-    const share = await host.startShare({ notes: true });
+    const share = await sharing(host, true);
     const send = (headers: Record<string, string>, body: Uint8Array<ArrayBuffer>) => fetch(`${h.baseUrl}/v1/live/calls/${host.ticket.callId}/shares/${share.share}/video`, {
       method: 'POST', headers: { origin: ORIGIN, 'x-alcove-call': host.ticket.pass, 'x-alcove-segment': '0', 'x-alcove-seq': '0', 'x-alcove-at-ms': '0', 'x-alcove-duration-ms': '5000', ...headers }, body
     });
@@ -287,7 +336,7 @@ async function presented(o: { seconds: number; share: Uint8Array<ArrayBuffer>[];
   const { code: c } = await org.api.calls.startNow({ notes: 'on' });
   const host = await org.api.calls.join(c, { mic: true, cam: false });
   for (let i = 0; i < o.seconds / 5; i++) await host.appendAudio(audio(i));
-  const share = await host.startShare({ notes: o.keep ?? true });
+  const share = await sharing(host, o.keep ?? true);
   if (share.keep) for (const [i, data] of o.share.entries()) await host.appendScreen(piece(share.share, i, { data, every: o.every }));
   for (const [at, words] of o.said) await host.transcribe(speech(words, at, o.ms), host.ticket.identity);
   if (o.model !== undefined) await host.setScreenModel(o.model);
@@ -546,7 +595,7 @@ describe('shared screens in the notes', () => {
     const { code: c } = await org.api.calls.startNow({ notes: 'on' });
     const host = await org.api.calls.join(c, { mic: true, cam: false });
     for (let i = 0; i < 4; i++) await host.appendAudio(audio(i));
-    const share = await host.startShare({ notes: true });
+    const share = await sharing(host, true);
     for (let i = 0; i < 3; i++) await host.appendScreen(piece(share.share, i));
     const noteId = (await host.leave())?.pendingNoteId ?? '';
     // The call is over, and the last piece of the share arrives just after.
@@ -571,7 +620,7 @@ describe('shared screens in the notes', () => {
     const { code: c } = await org.api.calls.startNow({ notes: 'on' });
     const host = await org.api.calls.join(c, { mic: true, cam: false });
     for (let i = 0; i < 4; i++) await host.appendAudio(audio(i));
-    const share = await host.startShare({ notes: true });
+    const share = await sharing(host, true);
     for (let i = 0; i < 4; i++) await host.appendScreen(piece(share.share, i));
     await host.transcribe(speech('As you can see the chart is up.', 2), host.ticket.identity);
     await host.shareEnded(share.share);
@@ -610,7 +659,7 @@ describe('shared screens in the notes', () => {
     const { code: c } = await org.api.calls.startNow({ notes: 'on' });
     const host = await org.api.calls.join(c, { mic: true, cam: false });
     for (let i = 0; i < 4; i++) await host.appendAudio(audio(i));
-    const share = await host.startShare({ notes: true });
+    const share = await sharing(host, true);
     for (let i = 0; i < 4; i++) await host.appendScreen(piece(share.share, i));
     await host.shareEnded(share.share);
     // The notes service isn't configured for the rest of this: no notes can be written, and replay doesn't wait for them.
@@ -645,7 +694,7 @@ describe('shared screens in the notes', () => {
     const { code: c } = await org.api.calls.startNow({ notes: 'on' });
     const host = await org.api.calls.join(c, { mic: true, cam: false });
     for (let i = 0; i < 4; i++) await host.appendAudio(audio(i));
-    const share = await host.startShare({ notes: true });
+    const share = await sharing(host, true);
     for (let i = 0; i < 4; i++) await host.appendScreen(piece(share.share, i));
     await host.shareEnded(share.share);
     const configured = h.deps.cfg;

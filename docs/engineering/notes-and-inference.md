@@ -1851,8 +1851,11 @@ object store: Cloud SQL's backups hold what they hold for a week.
 What goes with each choice:
 
 - **Without the recording,** the note has nothing to play (`Note.audio` is empty) and corrections can't be checked by
-  listening. Lines keep their places, the gaps theirs and the bill its minutes, because the note saved them first. The
-  recording's row stays: its key seals the shared-screen frames.
+  listening. Lines keep their places, the gaps theirs, shared screens theirs (each segment's length, `segmentSeconds`)
+  and the bill its minutes, because the note saved them first. Shared screens' video is kept only until the notes are
+  written, since their frames are taken from it, and then deleted with its pieces (`screens.purgeVideo`): the note has
+  no replay (`Note.shares` is empty) and its progress never says one is ready. The recording's row stays: its key seals
+  the shared-screen frames.
 - **Without the transcript,** there's nothing to correct or write the notes again from (`409 conflict`), search reads
   the title and notes alone, and questions read the notes ([Asking](#asking)). `Note.transcript` is empty with
   `kept.transcript` false, which is how the app tells it from a call where nothing was said. Until the notes are

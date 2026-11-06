@@ -239,8 +239,9 @@ async function settle(o: Owner, jobId: string, noteId: string, wrote: Wrote | un
       await exec(c, 'DELETE FROM operations WHERE owner_id = $1', [o.ownerId]);
       wlog.info('transcript deleted, as the call was set to', { noteId, revisions });
     }
-    const audio = next.keep.recording ? [] : await purgeAudio(o, c, next.recordingId);
-    return [...audio, ...await screens.dropUnused(o, c, noteId, left, new Set(next.screens.map((m) => m.id)))];
+    // Shared screens' video is kept only until the notes are written, since the frames are taken from it.
+    const unkept = next.keep.recording ? [] : [...await purgeAudio(o, c, next.recordingId), ...await screens.purgeVideo(o, c, next.recordingId)];
+    return [...unkept, ...await screens.dropUnused(o, c, noteId, left, new Set(next.screens.map((m) => m.id)))];
   });
   await queueDelete(o, leftover);
 }
@@ -357,7 +358,7 @@ async function attempt(d: Deps, job: Claimed): Promise<void> {
         await settle(o, job.job_id, noteId, undefined, await readSoFar());
         return;
       }
-      const shares = await screens.shareIntervals(o, recordingId);
+      const shares = await screens.shareIntervals(o, recordingId, note.manifest.segmentSeconds);
       // What was on shared screens comes first, so the notes can say what was shown while it was said. With shares
       // kept on video: frames picked from what was said, read with the model chosen and judged (screens.analyze), each
       // step kept in the job as it's done. With nothing said there's nothing to tie a screen to, so none are read.

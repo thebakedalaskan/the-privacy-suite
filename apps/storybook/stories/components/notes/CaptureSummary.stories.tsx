@@ -18,10 +18,10 @@ interface Parts { recording?: CaptureMode; transcript?: CaptureMode; ai?: Captur
 function captured(mode: CaptureMode, p: Parts = {}, away = false): CaptureState {
   return {
     mode, recording: part(p.recording ?? mode), transcript: part(p.transcript ?? mode), ai: part(p.ai ?? (mode === 'unavailable' ? 'on' : mode)),
-    screen: part(p.screen ?? 'off'), gaps: [], requests: [], asked: null, room: null, away, screenModel: null, readScreens: true
+    screen: part(p.screen ?? 'off'), gaps: [], requests: [], asked: null, room: null, away, screenModel: null, allowScreens: true
   };
 }
-const KEEPS_ALL: NotesChoices = { keepTranscript: true, keepRecording: true, readScreens: false };
+const KEEPS_ALL: NotesChoices = { keepTranscript: true, keepRecording: true, allowScreens: false };
 
 const meta = {
   title: 'Components/Notes and transcript/CaptureSummary',
@@ -63,7 +63,7 @@ export const AwayWithAScreenShared: Story = { name: 'Away, with a screen shared'
 /** The call started without notes: nothing to keep, so nothing more is said. */
 export const Off: Story = { args: { capture: captured('off') } };
 /** The call doesn't keep the transcript or the recording: said before anyone decides to join. */
-export const KeepsLess: Story = { name: 'Keeps less', args: { capture: captured('on'), choices: { keepTranscript: false, keepRecording: false, readScreens: false } } };
+export const KeepsLess: Story = { name: 'Keeps less', args: { capture: captured('on'), choices: { keepTranscript: false, keepRecording: false, allowScreens: false } } };
 /** Who gets the notes, said for someone invited. */
 export const YoureInvited: Story = { name: 'You’re invited', args: { capture: captured('on'), who: 'You’re invited, so you get them.' } };
 /** Who gets the notes, said for someone asking to join. */

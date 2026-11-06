@@ -157,7 +157,7 @@ export const part = (mode: CaptureMode, since: string | null, by: CapturePart['b
 export function captureOf(mode: 'on' | 'off' | 'paused', since: string | null, organizer: string): CaptureState {
   const by = since ? { kind: 'schedule' as const, name: organizer } : null;
   const p = part(mode, mode === 'off' ? null : since, mode === 'off' ? null : by);
-  return { mode, recording: p, transcript: p, ai: p, screen: part('off', null, null), gaps: [], requests: [], asked: null, room: null, away: false, screenModel: null, readScreens: true };
+  return { mode, recording: p, transcript: p, ai: p, screen: part('off', null, null), gaps: [], requests: [], asked: null, room: null, away: false, screenModel: null, allowScreens: true };
 }
 
 /** Without names: someone asking to join isn't told who changed what. */

@@ -111,6 +111,11 @@ export const NoteManifest = z.object({
    * is kept. Null until then, and on a note stopped before this was saved, whose audio is all still there to count.
    */
   recorded: z.number().nullable().default(null),
+  /**
+   * Each segment's seconds of audio, by segment index, saved when the recording stops, so shared screens keep their
+   * place once audio the call didn't keep is deleted. Empty in a note stored before.
+   */
+  segmentSeconds: z.array(z.number()).default([]),
   /** What this call came back to from earlier calls in its series, once the notes are written. */
   revisits: z.array(Revisit).default([]),
   /**
@@ -138,7 +143,7 @@ export function blankNote(o: { kind: NoteKind; title: string; startedAt: Date; r
     kind: o.kind, title: o.title, startedAt: o.startedAt.toISOString(), duration: 0, recordingId: o.recordingId,
     ...(o.meetingId ? { meetingId: o.meetingId } : {}), invited: o.invited, shared: [],
     status: 'recording', summary: '', decisions: [], questions: [], actions: [], chapters: [], gaps: [], screens: [], transcript: null, rooms: [], suggestedQuestions: [], writtenAt: null, workedOn: [],
-    breakouts: [], inference: [], keep: o.keep ?? KEEP_ALL, recorded: null, revisits: [], ticked: [], screenModel: null
+    breakouts: [], inference: [], keep: o.keep ?? KEEP_ALL, recorded: null, segmentSeconds: [], revisits: [], ticked: [], screenModel: null
   };
 }
 /** Creates the note item first, then its recording, in one transaction. */
@@ -175,7 +180,7 @@ export interface HeldRoom { id: string; name: string; people: Speaker[]; from: n
  * and the model the organizer chose to read shared screens (`screenModel`), and the follow-ups ticked during the call. Everyone
  * invited gets the note, and it's queued for the notes service (modules/writer.ts), which writes each room's notes too.
  * Runs in the stopping transaction, once the recording has stopped. A call set not to keep its recording loses its audio
- * here, after everything worked out from it (where lines fall, and the seconds billed) is in the note. Returns the
+ * here, after everything worked out from it (where lines fall, the seconds billed, and each segment's length) is in the note. Returns the
  * objects to delete once that transaction commits.
  */
 export async function finishRecording(o: Owner, db: Db, noteId: string, durationSeconds: number, breakouts: HeldRooms[] = [],
@@ -194,6 +199,7 @@ export async function finishRecording(o: Owner, db: Db, noteId: string, duration
   const next = await updateNote(o, db, noteId, (n) => ({
     ...n, status: 'pending', endedAt: new Date().toISOString(), duration: Math.max(n.duration, durationSeconds), breakouts, gaps, screenModel,
     recorded: audio.reduce((total, s) => total + s.seconds, 0),
+    segmentSeconds: Array.from({ length: audio.reduce((n, s) => Math.max(n, s.index + 1), 0) }, (_, i) => audio.find((s) => s.index === i)?.seconds ?? 0),
     // In a call, each line keeps whoever said it; a room recording names nobody.
     transcript: transcripts.spoken(heard, speakerOf), rooms: sections,
     inference: heardBy, ticked, workedOn
@@ -435,7 +441,7 @@ export async function get(o: Owner, id: string): Promise<Note> {
     ...summaryOf(l, organizer, who), recipients: who, summary: m.summary, decisions, questions, actions, chapters: m.chapters,
     gaps: m.gaps, screens: m.screens, transcript: read.transcript, rooms, additions: await additions.of(l, o.ownerId), writtenAt: m.writtenAt, writingAgain: m.status === 'ready' && !!(await jobOf(l.owner, l.owner.pool, id)),
     suggestedQuestions: m.suggestedQuestions, audio: await segments(l.owner, m.recordingId), kept: m.keep, inference: m.inference, workedOn: await workedOnFor(o, m.workedOn),
-    shares: await screens.shareIntervals(l.owner, m.recordingId), screenModel: m.screenModel, ...(seriesId ? { seriesId } : {})
+    shares: m.keep.recording ? await screens.shareIntervals(l.owner, m.recordingId, m.segmentSeconds) : [], screenModel: m.screenModel, ...(seriesId ? { seriesId } : {})
   };
 }
 /** A note's notes job while its notes are queued or being written, whichever of its revisions it was queued for. */
@@ -489,7 +495,7 @@ export async function progress(o: Owner, id: string): Promise<NoteProgress> {
       : job?.state === 'waiting' ? 'Waiting for the notes model. The notes are written as soon as it’s verified and answering'
         : job && job.attempt > 0 ? 'The notes service is busy. Trying again shortly'
           : 'Queued for the notes service';
-  const video = stopped ? await screens.videoReady(owner, m.recordingId) : null;
+  const video = stopped && m.keep.recording ? await screens.videoReady(owner, m.recordingId) : null;
   return {
     noteId: id, title: m.title, ready: done,
     steps: [
@@ -982,7 +988,8 @@ export async function correctLine(o: Owner, noteId: string, lineId: string, patc
  * The organizer's alone, since it's their note the notes service writes for. The note stays `ready` meanwhile, readable
  * and changeable by everyone who has it (`Note.writingAgain` says the notes are being written), and what people have
  * confirmed or changed by the time they're written stays (modules/writer.ts). Asking again while they're queued or
- * being written changes nothing. Call writer.kick after it.
+ * being written changes nothing, except a new `screenModel`: it's saved for the job that's waiting to read it, and
+ * refused while the notes are being written, which have read the old one. Call writer.kick after it.
  */
 export async function rewrite(o: Owner, noteId: string, opts: { screenModel?: string | null | undefined } = {}): Promise<Note> {
   const l = await locate(o, noteId);
@@ -997,12 +1004,18 @@ export async function rewrite(o: Owner, noteId: string, opts: { screenModel?: st
     const again = await tx(o.pool, async (c) => {
       // Holding the note while its job is looked for, so two asks at once queue one job.
       await lockItem(o, c, noteId);
-      if (await jobOf(o, c, noteId)) return false;
-      // Another model for shared screens: the notes keep it, and their frames are read again with it.
+      const job = await jobOf(o, c, noteId);
+      // Another model for shared screens: the notes keep it, and their frames are read again with it. A job that's
+      // queued or waiting reads it when it starts; one being written now has read the old one already.
       if (opts.screenModel !== undefined) {
         const screenModel = opts.screenModel;
-        await updateNote(o, c, noteId, (n) => ({ ...n, screenModel }));
+        const now = (await getItem(o, c, 'note', noteId, NoteManifest, 'Those notes')).manifest.screenModel;
+        if (screenModel !== now) {
+          if (job?.state === 'writing') throw new ConflictError('The notes are being written now. Choose the model again once they’re done.', { context: { noteId } });
+          await updateNote(o, c, noteId, (n) => ({ ...n, screenModel }));
+        }
       }
+      if (job) return false;
       await queueNotes(o, c, noteId, m.recordingId);
       return true;
     });

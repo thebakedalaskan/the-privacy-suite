@@ -71,12 +71,14 @@ async function run(what: string, args: string[], input: AsyncIterable<Uint8Array
   p.stdin.on('error', () => undefined);
   const feed = (async () => {
     try {
+      // Once ffmpeg is gone nothing reads what comes next, so the input stops being pulled (and fetched, and decrypted).
       for await (const chunk of input) {
-        if (p.stdin.destroyed) break;
+        if (gone || p.stdin.destroyed) break;
         inBytes += chunk.length;
         if (!p.stdin.write(chunk) && !gone) {
           await new Promise<void>((resolve) => { wake = resolve; p.stdin.once('drain', resolve); });
           wake = null;
+          if (gone || p.stdin.destroyed) break;
         }
       }
     } finally {

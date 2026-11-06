@@ -8,7 +8,9 @@
  *  - Pieces (`screen_pieces`): each sealed under the recording's key as an object under a random name, like audio.
  *  - Video (`screen_videos`): once the call is over, finishVideo joins each kept share's pieces in each segment into
  *    one video a browser can seek (ffmpeg, pipes only), sealed in 4 MiB chunks so replay opens only what a range
- *    needs, and deletes the pieces.
+ *    needs, and deletes the pieces. A share whose pieces can't be joined (not video, or failing its integrity check) is
+ *    left out of replay and its pieces deleted. A call set not to keep its recording keeps no video either: it stays
+ *    only until the notes are written, since the frames are taken from it (purgeVideo).
  *  - Frames (`screen_frames`): JPEGs taken from the video at moments picked from what was said (and so no stretch of a
  *    share goes long without one), each read by the vision model. The notes attach at most one to a transcript line;
  *    the rest only go into what the notes say, and are deleted once they're saved. Notes written before video was kept
@@ -355,14 +357,22 @@ export async function tailEndsAt(o: Pick<Owner, 'pool' | 'ownerId'>, recordingId
   return r.stopped - Math.max(0, callSeconds * 1000 - r.last) + SHARE_TAIL_MS;
 }
 
+/** The most a share's pieces may hold together for each second it has been up (about five times what a browser records), and before it starts counting. */
+const BUDGET_PER_SECOND = 250_000;
+const BUDGET_FROM_SECONDS = 30;
+/** The most a share's stored pieces may hold together once it has been up `seconds`. */
+export const shareBudget = (seconds: number) => Math.round((Math.max(0, seconds) + BUDGET_FROM_SECONDS) * BUDGET_PER_SECOND);
+
 /**
  * Encrypts, stores and verifies one piece of a kept share's video, after the call has let it through (calls.ts checks
  * whose share it is, that it's kept and going, or within its tail, and that notes are on). Sending a piece that's stored
  * already is a no-op, so retries are safe. Refused while notes are paused, and once the recording has stopped unless
  * it's the share's tail (`tail`). A piece that arrives once its share's video is joined is refused (404), so nothing is
- * left behind that the video doesn't hold: storing it holds the share's row, which joining locks.
+ * left behind that the video doesn't hold: storing it holds the share's row, which joining locks. A piece that would
+ * take the share's pieces past `budget` bytes (shareBudget, from how long it has been up) is refused (409), so nobody
+ * fills the organizer's storage under one share.
  */
-export async function appendPiece(o: Owner, recordingId: string, shareId: string, p: Piece, tail = false): Promise<void> {
+export async function appendPiece(o: Owner, recordingId: string, shareId: string, p: Piece, budget: number, tail = false): Promise<void> {
   const where = { recordingId, shareId, segment: p.segment, seq: p.seq, atMs: p.atMs, tail: tail ? 1 : 0 };
   if (await pieceStored(o, recordingId, shareId, p)) { slog.debug('screen piece already stored', where); return; }
   const { krec, state } = await krecOf(o, recordingId);
@@ -371,13 +381,17 @@ export async function appendPiece(o: Owner, recordingId: string, shareId: string
   const ct = sealRecord(krec, pieceHeader(o, recordingId, shareId, p.segment, p.seq, objectId), p.bytes);
   krec.fill(0);
   const digest = await putChecked(o, objectId, ct, where);
-  let inserted: number | 'joined';
+  let inserted: number | 'joined' | 'over';
   try {
-    inserted = await tx(o.pool, async (c): Promise<number | 'joined'> => {
+    inserted = await tx(o.pool, async (c): Promise<number | 'joined' | 'over'> => {
       await exec(c, 'SELECT 1 FROM screen_shares WHERE owner_id = $1 AND recording_id = $2 AND share_id = $3 FOR SHARE', [o.ownerId, recordingId, shareId]);
       const video = await maybeOne(c, z.object({ chunk: z.number() }), 'SELECT chunk FROM screen_videos WHERE owner_id = $1 AND recording_id = $2 AND share_id = $3 AND segment = $4 LIMIT 1',
         [o.ownerId, recordingId, shareId, p.segment]);
       if (video) return 'joined';
+      // What the share holds already, by the size of what was sent: a share is never more than its budget.
+      const held = await maybeOne(c, z.object({ bytes: z.coerce.number() }), 'SELECT coalesce(sum(cipher_bytes), 0) AS bytes FROM screen_pieces WHERE owner_id = $1 AND recording_id = $2 AND share_id = $3',
+        [o.ownerId, recordingId, shareId]);
+      if ((held?.bytes ?? 0) + ct.length > budget) return 'over';
       const n = await exec(c, `INSERT INTO screen_pieces (owner_id, recording_id, share_id, segment, seq, at_ms, duration_ms, object_id, cipher_sha256, cipher_bytes, mime_type)
                                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`,
         [o.ownerId, recordingId, shareId, p.segment, p.seq, p.atMs, p.durationMs, objectId, digest, ct.length, p.mimeType]);
@@ -389,6 +403,10 @@ export async function appendPiece(o: Owner, recordingId: string, shareId: string
     slog.warn('screen piece not recorded; deleting its object', { ...where, objectId, err: e });
     await queueDelete(o, [objectId]);
     throw e;
+  }
+  if (inserted === 'over') {
+    await queueDelete(o, [objectId]);
+    throw conflict('This shared screen has sent more video than it could have recorded.', { ...where, bytes: ct.length, budget });
   }
   if (inserted === 'joined') {
     await queueDelete(o, [objectId]);
@@ -438,7 +456,7 @@ const groupsOf = (o: Owner, db: Db, recordingId: string, only?: { share: string;
  * seek, seals it into chunks, and deletes the pieces (rows, then objects). The chunks and the pieces' end are one
  * transaction, so a job that stopped halfway and runs again carries on: whatever has its video only loses its pieces.
  * A piece that came in while the video was being joined (its share's tail) is joined in once more. A share whose video
- * won't join (ffmpeg can't read it, or a piece fails its integrity check) keeps its pieces and is left out of replay;
+ * won't join (ffmpeg can't read it, or a piece fails its integrity check) is left out of replay and its pieces deleted;
  * the object store failing is thrown, so the job tries again. Safe to run again.
  */
 export async function finishVideo(o: Owner, recordingId: string): Promise<{ videos: number; failed: number }> {
@@ -501,6 +519,7 @@ export async function joinDue(d: Deps, ownerId?: string | undefined): Promise<{ 
   return { joined, waitMs };
 }
 
+/** Joins every kept share's pieces, segment by segment. A share that can't be joined fails for good, so it is counted and its pieces deleted. */
 async function joinVideo(o: Owner, recordingId: string): Promise<{ videos: number; failed: number }> {
   const groups = await groupsOf(o, o.pool, recordingId);
   let videos = 0;
@@ -519,7 +538,9 @@ async function joinVideo(o: Owner, recordingId: string): Promise<{ videos: numbe
         video = await remux(piecesOf(o, recordingId, g.share_id, g.segment), g.mime_type);
       } catch (e) {
         if (!(e instanceof MediaError) && !(e instanceof IntegrityError)) throw e;
-        slog.at(e instanceof IntegrityError ? 'error' : 'warn', 'a shared screen’s video couldn’t be joined; left out of replay', { ...ctx, err: e });
+        slog.at(e instanceof IntegrityError ? 'error' : 'warn', 'a shared screen’s video couldn’t be joined; left out of replay, and its pieces deleted', { ...ctx, err: e });
+        // Both failures are the same every time, so the pieces go rather than being joined again at every upkeep.
+        await dropPieces(o, recordingId, g.share_id, g.segment);
         failed++;
         break;
       }
@@ -621,20 +642,38 @@ async function dropPieces(o: Owner, recordingId: string, shareId: string, segmen
   await queueDelete(o, gone);
 }
 
+/**
+ * Deletes a recording's shared-screen video and pieces, in the caller's transaction, for a call set not to keep its
+ * recording: stored bytes go down to match. Returns their objects, for the caller to delete once the transaction
+ * commits (queueDelete).
+ */
+export async function purgeVideo(o: Owner, db: Db, recordingId: string): Promise<string[]> {
+  const gone = [
+    ...await rows(db, z.object({ object_id: z.string(), cipher_bytes: z.coerce.number() }), 'DELETE FROM screen_videos WHERE owner_id = $1 AND recording_id = $2 RETURNING object_id, cipher_bytes', [o.ownerId, recordingId]),
+    ...await rows(db, z.object({ object_id: z.string(), cipher_bytes: z.coerce.number() }), 'DELETE FROM screen_pieces WHERE owner_id = $1 AND recording_id = $2 RETURNING object_id, cipher_bytes', [o.ownerId, recordingId])
+  ];
+  if (!gone.length) return [];
+  await exec(db, 'UPDATE owners SET stored_bytes = greatest(0, stored_bytes - $2), version = version + 1 WHERE owner_id = $1', [o.ownerId, gone.reduce((n, x) => n + x.cipher_bytes, 0)]);
+  slog.info('shared screen video deleted, as the call was set to', { recordingId, objects: gone.length });
+  return gone.map((x) => x.object_id);
+}
+
 const VideoRow = z.object({ share_id: z.string(), segment: z.number(), at_ms: z.number(), duration_ms: z.number(), meta_ciphertext: bytea, started_ms: z.coerce.number() });
 
 /**
  * The kept shares that have video, oldest first, on the recording's timeline as the note's player counts it: a segment
  * starts where the audio of the segments before it ends, and a share's video in a segment starts `at_ms` into it
  * (pauses not counted, like audio). Its video's own time 0 is that `at`. Each with whose it was and a label to tell it
- * apart from their other shares ("Priya’s screen", then "Priya’s screen (2)").
+ * apart from their other shares ("Priya’s screen", then "Priya’s screen (2)"). Segment lengths are `kept` (seconds by
+ * segment index, saved in the note when the recording stopped) when there are any, and otherwise the audio's own: a
+ * call that doesn't keep its recording has no audio left to measure.
  */
-export async function shareIntervals(o: Owner, recordingId: string): Promise<ScreenShare[]> {
+export async function shareIntervals(o: Owner, recordingId: string, kept: number[]): Promise<ScreenShare[]> {
   const found = await rows(o.pool, VideoRow, `SELECT v.share_id, v.segment, v.at_ms, v.duration_ms, s.meta_ciphertext, s.started_ms
                                                FROM screen_videos v JOIN screen_shares s ON s.owner_id = v.owner_id AND s.recording_id = v.recording_id AND s.share_id = v.share_id
                                                WHERE v.owner_id = $1 AND v.recording_id = $2 AND v.chunk = 0 AND s.keep ORDER BY s.started_ms, v.share_id, v.segment`, [o.ownerId, recordingId]);
   if (!found.length) return [];
-  const audio = await segments(o, recordingId);
+  const audio = kept.length ? kept.map((seconds, index) => ({ index, seconds })) : await segments(o, recordingId);
   const before = (segment: number) => audio.filter((g) => g.index < segment).reduce((n, g) => n + g.seconds, 0);
   const length = (segment: number) => audio.find((g) => g.index === segment)?.seconds;
   const tenth = (x: number) => Math.round(x * 10) / 10;

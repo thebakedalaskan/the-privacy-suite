@@ -13,7 +13,7 @@ import { maintain } from './maintenance';
 import { openOwner } from './owners';
 import { speechWav } from './testing/fake-near';
 import { startHarness, type Harness } from './testing/harness';
-import { disposeLiveKit, type TestParticipant } from './testing/livekit';
+import { disposeLiveKit, presentScreen, stopPresenting, type TestParticipant } from './testing/livekit';
 import { cut, recordedWebm } from './testing/video';
 import { getItem, saveRevision } from './vault';
 
@@ -24,7 +24,7 @@ let h: Harness;
 beforeAll(async () => { h = await startHarness(); });
 afterAll(async () => { await h?.close(); await disposeLiveKit(); });
 const open: TestParticipant[] = [];
-afterEach(async () => { await Promise.all(open.splice(0).map((p) => p.disconnect().catch(() => undefined))); h.closeCalls(); });
+afterEach(async () => { await Promise.all(open.splice(0).map((p) => p.disconnect().catch(() => undefined))); await stopPresenting(); h.closeCalls(); });
 
 const code = (e: unknown) => (e instanceof AlcoveApiError ? e.code : 'not-an-api-error');
 const message = (e: unknown) => (e instanceof AlcoveApiError ? e.message : '');
@@ -369,9 +369,10 @@ describe('keeping the recording', () => {
     await call.leave();
   });
 
-  it('keeps shared screens, which its key seals, and with neither kept the notes still stand on their own', async () => {
+  it('keeps the shared screens the notes attach, which its key seals, but not their video, and with neither kept the notes still stand on their own', async () => {
     const org = await account(unique('organizer'));
-    const { call } = await held(org, { keepTranscript: false, keepRecording: false, readScreens: true });
+    const { call } = await held(org, { keepTranscript: false, keepRecording: false, allowScreens: true });
+    await presentScreen(call, h.deps.livekit);
     const { share } = await call.startShare({ notes: true });
     for (const [i, data] of cut(await recordedWebm(10), 2).entries()) await call.appendScreen(screenPiece(share, i, data));
     await call.shareEnded(share);
@@ -381,7 +382,9 @@ describe('keeping the recording', () => {
     await written(org.api, noteId);
     const note = await org.api.notes.get(noteId);
     expect(note).toMatchObject({ status: 'ready', transcript: [], audio: [], kept: { transcript: false, recording: false }, decisions: [{ text: DECIDED }] });
-    expect(note.shares).toHaveLength(1);
+    // The frames the notes attached stay; the video they were taken from goes with the recording, so there's no replay.
+    expect(note.shares).toEqual([]);
+    expect((await h.pool.query('SELECT 1 FROM screen_videos WHERE owner_id = $1', [org.session.ownerId])).rowCount).toBe(0);
     const [moment] = note.screens;
     expect(moment?.share).toBe(share);
     expect((await org.fetch(org.api.notes.screenUrl(noteId, moment?.id ?? ''))).status).toBe(200);
@@ -656,9 +659,9 @@ describe('a call with breakout rooms', () => {
 describe('the organizer’s permission to read shared screens', () => {
   it('lets a presenter keep a share for the notes when scheduled so, and shows everyone while it goes', async () => {
     const org = await account(unique('organizer'));
-    const { meeting, call } = await held(org, { readScreens: true });
-    expect(call.getSnapshot().capture).toMatchObject({ readScreens: true, screen: { mode: 'off' } });
-    expect(await h.browser().api.calls.card(meeting.code)).toMatchObject({ choices: { readScreens: true } });
+    const { meeting, call } = await held(org, { allowScreens: true });
+    expect(call.getSnapshot().capture).toMatchObject({ allowScreens: true, screen: { mode: 'off' } });
+    expect(await h.browser().api.calls.card(meeting.code)).toMatchObject({ choices: { allowScreens: true } });
     const { share, keep } = await call.startShare({ notes: true });
     expect(keep).toBe(true);
     expect(call.getSnapshot().capture.screen.mode).toBe('on');
@@ -669,13 +672,27 @@ describe('the organizer’s permission to read shared screens', () => {
 
   it('refuses to keep a share when scheduled not to, but still lets it be shared', async () => {
     const org = await account(unique('organizer'));
-    const { meeting, call } = await held(org, { readScreens: false });
-    expect(call.getSnapshot().capture).toMatchObject({ readScreens: false, screen: { mode: 'off' } });
-    expect(await h.browser().api.calls.card(meeting.code)).toMatchObject({ choices: { readScreens: false } });
+    const { meeting, call } = await held(org, { allowScreens: false });
+    expect(call.getSnapshot().capture).toMatchObject({ allowScreens: false, screen: { mode: 'off' } });
+    expect(await h.browser().api.calls.card(meeting.code)).toMatchObject({ choices: { allowScreens: false } });
     expect(await fails(call.startShare({ notes: true }))).toEqual(['conflict', 'The organizer keeps shared screens out of these notes.']);
     const plain = await call.startShare({ notes: false });
     expect(plain.keep).toBe(false);
     expect(call.getSnapshot().capture.screen.mode).toBe('off');
+    await call.leave();
+  });
+
+  it('allows shares in the notes for a meeting scheduled with choices from before the setting existed', async () => {
+    const org = await account(unique('organizer'));
+    const res = await org.fetch(`${h.baseUrl}/v1/meetings`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'Supplier review', startsAt: new Date(Date.now() + 3_600_000).toISOString(), durationMinutes: 30, guests: [], notes: 'on', choices: { keepTranscript: true, keepRecording: true } })
+    });
+    expect(res.status).toBe(200);
+    const { code } = z.object({ code: z.string() }).parse(await res.json());
+    const call = await org.api.calls.join(code, { mic: true, cam: false });
+    expect(call.getSnapshot().capture.allowScreens).toBe(true);
+    expect(await h.browser().api.calls.card(code)).toMatchObject({ choices: { keepTranscript: true, keepRecording: true, allowScreens: true } });
     await call.leave();
   });
 });

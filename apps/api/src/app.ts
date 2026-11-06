@@ -628,7 +628,7 @@ export function createApp(d: Deps, stopping?: AbortSignal | undefined) {
   });
   app.post('/v1/live/calls/:id/shares/:share/video', async (c) => {
     const v = c.get('viewer');
-    calls.requireIn(v, 'screen');
+    // Not only while they're in: someone who just left still sends their share's last piece, which the call checks.
     videoLimiter(v.pass.identity, 'screen-video');
     const share = c.req.param('share');
     if (!ID128.test(share)) throw new NotFoundError('That share doesn’t exist.');

@@ -163,12 +163,12 @@ function modes(status: CaptureStatus, everOn: boolean): Record<Part, CaptureMode
  * for people in the call; people asking to join get no name, no gaps and no asks. A part the host's browser says
  * it can't do is unavailable while notes are on, and so is everything when it can do neither, or while that
  * browser is out of the call (`away`). Shared screens are on while a share kept for the notes is going (`screens.live`),
- * paused with notes. `screenModel` is the organizer's choice of model to read them, and `readScreens` whether shares
+ * paused with notes. `screenModel` is the organizer's choice of model to read them, and `allowScreens` whether shares
  * may go in the notes at all.
  */
 export function stateFor(c: {
   status: CaptureStatus; history: CaptureChange[]; startedAt: Date; organizer: string | null; unavailable: CaptureDevicePart[]; away: boolean;
-  screens: { live: boolean; history: ScreenChange[] }; screenModel: string | null; readScreens: boolean;
+  screens: { live: boolean; history: ScreenChange[] }; screenModel: string | null; allowScreens: boolean;
   gaps: CaptureGap[]; requests: NotesRequest[]; asked: CaptureState['asked'];
 }): CaptureState {
   const when = (at: number) => new Date(c.startedAt.getTime() + at * 1000).toISOString();
@@ -191,7 +191,7 @@ export function stateFor(c: {
   return {
     mode: cant.has('recording') && cant.has('transcript') ? 'unavailable' : c.status,
     recording: part('recording'), transcript: part('transcript'), ai: part('ai'), screen: screenPart(c, when, actor),
-    gaps: c.gaps, requests: c.requests, asked: c.asked, room: null, away: c.away, screenModel: c.screenModel, readScreens: c.readScreens
+    gaps: c.gaps, requests: c.requests, asked: c.asked, room: null, away: c.away, screenModel: c.screenModel, allowScreens: c.allowScreens
   };
 }
 

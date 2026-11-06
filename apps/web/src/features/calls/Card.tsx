@@ -332,7 +332,7 @@ function MoveCards({ times, current, chosen, onPick }: { times: ReturnType<typeo
 function ChangeNotes({ m, scopeBar, fail, told, saving, onSave }: Change) {
   const [notes, setNotes] = useState<NotesSetting>(m.notes);
   const [choices, setChoices] = useState<NotesChoices>(m.choices);
-  const sameChoices = (['keepTranscript', 'keepRecording', 'readScreens'] as const).every((k) => choices[k] === m.choices[k]);
+  const sameChoices = (['keepTranscript', 'keepRecording', 'allowScreens'] as const).every((k) => choices[k] === m.choices[k]);
   const changed = notes !== m.notes || !sameChoices;
   return (
     <>

@@ -355,7 +355,8 @@ function InCall({ session }: { session: CallSession }) {
    * Your own shared screen, when you said it goes in the notes (features/call/screenRecord.ts): this browser records it
    * while notes are on, the call is live and you aren't in a breakout room, from ten seconds after it started. Paused or
    * off, it stops at once and drops what wasn't sent; resuming records into the new segment. A share that ends (stopped,
-   * or swapped for something else) sends its last piece, then says so, so its video stops there in the notes.
+   * or swapped for something else), or you leaving, or the call ending, sends what was recorded: the call keeps taking a
+   * share's last pieces for a few seconds after it ends. A share that ends says so after that, so its video stops there in the notes.
    */
   const screens = useRef<ScreenRecorder | null>(null);
   if (!screens.current) screens.current = new ScreenRecorder((p) => session.appendScreen(p), setScreenProblem);
@@ -382,20 +383,21 @@ function InCall({ session }: { session: CallSession }) {
     const r = screens.current;
     if (!r) return;
     const seen = segmentSeen.current;
-    // A segment this page saw begin counts from then; the one it opened in, from when the call says it began. The first
-    // segment is 0 before notes are ever on too, so notes coming on begins one.
-    if (!seen) segmentSeen.current = { segment, on, origin: on ? segmentOrigin(state) : performance.now() };
-    else if (seen.segment !== segment || (on && !seen.on)) segmentSeen.current = { segment, on, origin: performance.now() };
+    // Every segment is placed from when the call says it began, as the server places breakout rooms' speech: this page
+    // notices a new segment a second or three late, and the audio is already counted from the server's start. With
+    // notes off there is nothing to place yet. The first segment is 0 before notes are ever on too, so notes coming on
+    // begins one.
+    if (!seen || seen.segment !== segment || (on && !seen.on)) segmentSeen.current = { segment, on, origin: on ? segmentOrigin(state) : performance.now() };
     else if (seen.on !== on) segmentSeen.current = { ...seen, on };
     const origin = segmentSeen.current?.origin ?? performance.now();
     if (recordScreen && mine) r.record({ stream: mine.stream, share: mine.share, since: mine.since, segment, origin });
-    else if (!on || leaving || ended) r.discard();
+    else if (!on && !leaving && !ended) r.discard();
     else void r.finish();
-    // `state` is read only for a segment this page didn't see begin.
+    // `state` is read only as a segment begins or notes come on: its change alone doesn't restart anything.
   }, [recordScreen, mine, segment, on, leaving, ended]);
   // What you share stopped, or something else took its place: that share is over.
   useEffect(() => { if (mine && m.screen !== mine.stream) endMine(); });
-  useEffect(() => () => screens.current?.discard(), []);
+  useEffect(() => () => { void screens.current?.finish(); }, []);
 
   /* What the call says happened ("Notes are on…") arrives once, as a toast. Joining shows only the latest: the rest is history. */
   const shown = useRef<Set<string> | null>(null);
@@ -1482,7 +1484,7 @@ function InCall({ session }: { session: CallSession }) {
         </footer>
       </div>
       <SharePicker open={sharePick} onOpenChange={(o) => { setSharePick(o); if (!o) setShareTrouble(null); }} sharing={!!m.screen}
-        others={sharing.map((s) => s.presenter)} trouble={shareTrouble} read={sharingInRoom || !state.capture.readScreens ? undefined : screenRead(state.capture.mode)} onShare={share} />
+        others={sharing.map((s) => s.presenter)} trouble={shareTrouble} read={sharingInRoom || !state.capture.allowScreens ? undefined : screenRead(state.capture.mode)} onShare={share} />
       <MoveSheet open={moving.open} onOpenChange={(o) => { if (!o) moving.hide(); }} move={moving.move} media={{ mic: m.mic, cam: m.cam }} account={state.role !== 'guest'}
         sharing={!!m.screen} onStopSharing={stopShare} onMove={() => void moving.go()} onAgain={moving.again} />
       <LeaveSheet open={leaveOpen || !!ended} onOpenChange={(o) => { setLeaveOpen(o); if (!o) guard.stay(); }} title={state.title} elapsed={state.elapsed}

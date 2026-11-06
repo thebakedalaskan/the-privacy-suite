@@ -11,7 +11,7 @@ import { randomBytes } from 'node:crypto';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { speechWav } from './testing/fake-near';
 import { ORIGIN, startHarness, type Harness } from './testing/harness';
-import { disposeLiveKit, type TestParticipant } from './testing/livekit';
+import { disposeLiveKit, presentScreen, stopPresenting, type TestParticipant } from './testing/livekit';
 import { cut, recordedWebm } from './testing/video';
 
 // Calls set up MLS groups and LiveKit rooms, which a busy runner can be slow to do: every wait says what it waited for.
@@ -21,7 +21,7 @@ let h: Harness;
 beforeAll(async () => { h = await startHarness(); });
 afterAll(async () => { await h?.close(); await disposeLiveKit(); });
 const open: TestParticipant[] = [];
-afterEach(async () => { await Promise.all(open.splice(0).map((p) => p.disconnect().catch(() => undefined))); h.closeCalls(); });
+afterEach(async () => { await Promise.all(open.splice(0).map((p) => p.disconnect().catch(() => undefined))); await stopPresenting(); h.closeCalls(); });
 
 const code = (e: unknown) => (e instanceof AlcoveApiError ? e.code : 'not-an-api-error');
 const fails = (p: Promise<unknown>) => p.then(() => 'succeeded', (e: unknown) => code(e));
@@ -271,6 +271,7 @@ describe('bookmarks', () => {
     await host.transcribe(speech('Look at the chart.', 0, 0), host.ticket.identity);
     await settle(host, (s) => s.transcript.length >= 1);
     await inGroup(lenaCall);
+    await presentScreen(lenaCall, h.deps.livekit);
     const { share } = await lenaCall.startShare({ notes: true });
     for (const [i, data] of cut(await recordedWebm(10), 2).entries()) {
       await lenaCall.appendScreen({ data: new Blob([data]), share, segment: 0, seq: i, at: i * 5, durationMs: 5000, mimeType: 'video/webm;codecs=vp8' } satisfies ScreenPiece);

@@ -14,12 +14,13 @@ import { startFakeDstack } from './testing/fake-dstack';
 import { PNG, type GoogleUser, type Spoil } from './testing/fake-google';
 import { speechWav, startFakeNear, type Tamper } from './testing/fake-near';
 import { ORIGIN, cookieFetch, startHarness, type Browser, type Harness } from './testing/harness';
+import { disposeLiveKit, presentScreen, stopPresenting } from './testing/livekit';
 import { cut, recordedWebm } from './testing/video';
 
 let h: Harness;
 beforeAll(async () => { h = await startHarness(); });
-afterAll(async () => { await h?.close(); });
-afterEach(() => h.closeCalls());
+afterAll(async () => { await h?.close(); await disposeLiveKit(); });
+afterEach(async () => { await stopPresenting(); h.closeCalls(); });
 
 function audioBytes(marker: string): Uint8Array<ArrayBuffer> {
   const src = Buffer.concat([Buffer.from(marker), randomBytes(4096)]);
@@ -943,6 +944,7 @@ describe('calls with notes', () => {
     const call = await api.calls.join((await api.calls.startNow({ notes: 'on' })).code, { mic: true, cam: false });
     for (let seq = 0; seq < 4; seq++) await call.appendAudio(piece(audioBytes(`talk-${seq}`), 0, seq));
     // They say yes to "Include this share in the notes?", and their browser sends the share's video every five seconds.
+    await presentScreen(call, h.deps.livekit);
     const shared = await call.startShare({ notes: true });
     expect(shared.keep).toBe(true);
     expect(call.getSnapshot()).toMatchObject({ shares: [{ id: shared.share, keep: true }], capture: { screen: { mode: 'on' } } });
@@ -2751,6 +2753,7 @@ describe('deleting an account', () => {
     await live.appendAudio(piece(audioBytes('leaving-live'), 0, 0));
     await live.transcribe(speech('We are still talking.', 0, 0), live.ticket.identity);
     // She shares her screen into the notes, and her browser has sent a piece of its video.
+    await presentScreen(live, h.deps.livekit);
     const sharing = await live.startShare({ notes: true });
     await live.appendScreen({ data: new Blob([audioBytes('leaving-screen')]), share: sharing.share, segment: 0, seq: 0, at: 0, durationMs: 5000, mimeType: 'video/webm;codecs=vp8' });
     expect(await live.translate(live.getSnapshot().transcript.map((l) => l.id), 'de')).toHaveLength(1);
@@ -3045,6 +3048,7 @@ describe('the shared demo account', () => {
 });
 
 describe('privacy at rest', () => {
+  // It touches every kind of stored record, a shared screen published in the call's room among them: it takes a while.
   it('keeps names, emails, titles, guests, chat, groups and audio out of rows, objects and logs in any encoding', async () => {
     // Watch the wire for the session cookies a browser receives, so the logs can be checked for them too.
     const secrets: string[] = [];
@@ -3081,6 +3085,7 @@ describe('privacy at rest', () => {
     const call = await c.api.calls.join(started.code, { mic: true, cam: true });
     await call.appendAudio(piece(audioBytes('CANARY-AUDIO-RAW'), 0, 0));
     // Canary Person shares their screen for the notes: its video (titled with a canary) is sealed, and so is their name.
+    await presentScreen(call, h.deps.livekit);
     const shared = await call.startShare({ notes: true });
     await call.appendScreen({ data: new Blob([await recordedWebm(5, { size: '320x180', title: 'CANARY-VIDEO deck' })]), share: shared.share, segment: 0, seq: 0, at: 0, durationMs: 5000, mimeType: 'video/webm;codecs=vp8' });
     await call.transcribe(speech('CANARY-SPEECH the merger closes on Friday.', 0, 0), call.ticket.identity);
@@ -3323,7 +3328,7 @@ describe('privacy at rest', () => {
       expect(logText.includes(t), 'a refresh token in logs').toBe(false);
     }
     expect(logText).not.toContain(m.code);
-  });
+  }, 90_000);
 });
 
 describe('confidential computing', () => {

@@ -10,7 +10,7 @@ import type { Deps, Owner } from '../context';
 import type { LiveKitEvent } from '../livekit';
 import { b64u, id128, mac, openJson, openRecord, sealJson, sealRecord, stateKey, toJson, unb64u, utf8 } from '../crypto';
 import { bytea, exec, maybeOne, rows, timestamp, tx, type Db } from '../db';
-import { AuthError, ConflictError, ForbiddenError, NotFoundError, ValidationError, notFound } from '../errors';
+import { AuthError, ConflictError, ForbiddenError, NotFoundError, UnavailableError, ValidationError, notFound } from '../errors';
 import { findOwner, openOwner } from '../owners';
 import { me, profile } from './account';
 import { CallBoards, CallSpace, NO_BOARDS, NO_SPACE, withWorked, type WorkedBy, type WorkedDocument } from './callSpace';
@@ -449,7 +449,7 @@ async function view(v: Viewer, db: Db, callId: string): Promise<CallState> {
     host: who,
     capture: {
       ...capture.stateFor({
-        status: s.notes.status, history: s.notes.history, startedAt: row.started_at, organizer: organizer.name, unavailable: s.notes.unavailable, away: hostAway(row), screens: screensOf(s), screenModel: s.notes.screenModel, readScreens: meeting.manifest.choices.readScreens,
+        status: s.notes.status, history: s.notes.history, startedAt: row.started_at, organizer: organizer.name, unavailable: s.notes.unavailable, away: hostAway(row), screens: screensOf(s), screenModel: s.notes.screenModel, allowScreens: meeting.manifest.choices.allowScreens,
         gaps: capture.gapsOf(s.notes.history, s.notes.offline, row.started_at, segs, row.ended_at ? secondsIn(row.started_at, row.ended_at.getTime()) : undefined),
         // Open asks, from whoever is in the call now: everyone sees them, like raised hands.
         requests: s.notes.asks.flatMap((a) => {
@@ -497,7 +497,7 @@ function hostOf(s: Stored, v: Viewer, organizer: Person, live: boolean): CallHos
 
 /** What's captured, for someone who isn't in the call (asking to join, or reading the call's card): no names, no gaps, no asks. */
 function anonymousCapture(s: Stored, row: Pick<Row, 'started_at' | 'state' | 'host_identity' | 'host_left_at'>) {
-  return capture.stateFor({ status: s.notes.status, history: s.notes.history, startedAt: row.started_at, organizer: null, unavailable: s.notes.unavailable, away: hostAway(row), screens: screensOf(s), screenModel: null, readScreens: false, gaps: [], requests: [], asked: null });
+  return capture.stateFor({ status: s.notes.status, history: s.notes.history, startedAt: row.started_at, organizer: null, unavailable: s.notes.unavailable, away: hostAway(row), screens: screensOf(s), screenModel: null, allowScreens: false, gaps: [], requests: [], asked: null });
 }
 
 /**
@@ -1568,8 +1568,8 @@ export async function startShare(v: Viewer, callId: string, notes: boolean): Pro
     const ctx = { callId, notes: state.notes.status, asked: notes };
     if (notes && state.notes.status === 'off') throw new ConflictError('Turn on notes first: only then can a share go in them.', { context: ctx });
     // The organizer decides whether shares may go in the notes at all (the call's choices); each presenter, for theirs.
-    const { readScreens } = (await getItem(o, c, 'meeting', row.meeting_item_id, MeetingManifest, 'That meeting')).manifest.choices;
-    if (notes && !readScreens) throw new ConflictError('The organizer keeps shared screens out of these notes.', { context: ctx });
+    const { allowScreens } = (await getItem(o, c, 'meeting', row.meeting_item_id, MeetingManifest, 'That meeting')).manifest.choices;
+    if (notes && !allowScreens) throw new ConflictError('The organizer keeps shared screens out of these notes.', { context: ctx });
     // Where they are now, with rooms whose time is up closed.
     const settled = settle(state, row);
     const mine = settled.people.find((j) => j.identity === v.pass.identity && j.status === 'in');
@@ -1591,41 +1591,68 @@ export async function startShare(v: Viewer, callId: string, notes: boolean): Pro
   return { share: r.id, keep: r.keep, state: await view(v, o.pool, callId) };
 }
 
+/** Who LiveKit said is sharing a screen, by room and identity, for a few seconds: pieces come every five. */
+const sharing = new Map<string, number>();
+const SHARE_SEEN_MS = 10_000;
+const NOT_YOURS = 'That isn’t a screen you’re sharing in this call.';
+/** Whether `identity` has a screen up in the call's room now, as LiveKit sees its tracks. Never a camera. */
+async function sharingNow(o: Owner, roomName: string, identity: string): Promise<boolean> {
+  const id = `${roomName}|${identity}`;
+  if ((sharing.get(id) ?? 0) > Date.now()) return true;
+  const shares = await o.livekit.screenShares(roomName).catch((e: unknown) => {
+    throw new UnavailableError('We couldn’t check the shared screen with the call’s media server. Try again in a moment.', { cause: e });
+  });
+  const yes = shares.some((x) => x.identity === identity);
+  if (yes) {
+    if (sharing.size > 10_000) sharing.clear();
+    sharing.set(id, Date.now() + SHARE_SEEN_MS);
+  }
+  return yes;
+}
+
 /**
  * A piece of a kept share's video, from its presenter's own browser. Only the presenter's own share that they said goes
- * in the notes (403 otherwise); one that's unknown isn't found (404). One that has ended (or whose call has) still takes
- * pieces of the segment it ended in for screens.SHARE_TAIL_MS after it ended, since the browser hands its last piece
- * over as it stops; after that it isn't found (404), unless it's a piece already stored (a retry), which changes
- * nothing. While notes are paused or off it's refused (409), as is a piece from an earlier segment of the recording,
- * or a different piece at a place already stored. After the call has ended the answer shows only that it has.
+ * in the notes, while LiveKit lists a screen they're sharing in the call's room (403 otherwise); one that's unknown isn't
+ * found (404). One that has ended (they stopped it, left, or the call ended) still takes pieces of the segment it ended
+ * in for screens.SHARE_TAIL_MS after it ended, since the browser hands its last piece over as it stops, even from
+ * someone who has just left; after that it isn't found (404), unless it's a piece already stored (a retry), which
+ * changes nothing. While notes are paused or off it's refused (409), as is a piece from an earlier segment of the
+ * recording, or a different piece at a place already stored. Once the presenter is out of the call, or the call has
+ * ended, the answer shows only that.
  */
 export async function appendScreen(v: Viewer, callId: string, shareId: string, piece: screens.Piece): Promise<CallState> {
-  requireIn(v, 'screen');
   const o = v.organizer;
   const { row, state } = await load(o, o.pool, callId);
   const ctx = { callId, segment: piece.segment, seq: piece.seq, currentSegment: state.notes.segment, role: v.pass.role };
+  // Someone let in, who may have left since: the tail of a share is theirs to send.
+  const mine = state.people.find((j) => j.identity === v.pass.identity);
+  if (!v.inCall && mine?.status !== 'left') throw new ForbiddenError('Wait until the host lets you in.', { context: { ...ctx, what: 'screen' } });
   const share = state.shares.find((x) => x.id === shareId);
   if (!share) throw notFound('That share', ctx);
-  if (share.identity !== v.pass.identity) throw new ForbiddenError('That isn’t a screen you’re sharing in this call.', { context: ctx });
+  if (share.identity !== v.pass.identity) throw new ForbiddenError(NOT_YOURS, { context: ctx });
   const recordingId = state.notes.recordingId;
   if (!share.recorded || !recordingId) throw new ForbiddenError('That share doesn’t go in the notes.', { context: ctx });
-  const answer = () => view(row.state === 'live' ? v : { ...v, inCall: false }, o.pool, callId);
+  const answer = () => view(row.state === 'live' && v.inCall ? v : { ...v, inCall: false }, o.pool, callId);
+  // How much it may hold: by how long it has been up, to now or to its end.
+  const budget = () => screens.shareBudget((share.until ?? (Date.now() - row.started_at.getTime()) / 1000) - share.from);
   // A retry of a piece already stored is fine whatever has happened since.
   if (await screens.pieceStored(o, recordingId, shareId, piece)) return answer();
   if (!share.keep) throw new ForbiddenError('That share doesn’t go in the notes.', { context: ctx });
-  if (share.until !== null || row.state !== 'live') {
-    // Its tail: the presenter's last piece, arriving just after the share (or the call) ended.
+  if (share.until !== null || row.state !== 'live' || !v.inCall) {
+    // Its tail: the presenter's last piece, arriving just after the share (or the call) ended, or they left.
     const end = await screens.shareEnd(o, recordingId, shareId, row.started_at);
     const late = end ? Date.now() - end.at : null;
     if (!end || !end.keep || late === null || late > screens.SHARE_TAIL_MS) throw notFound('That share', { ...ctx, ended: 1, lateMs: late });
     if (piece.segment !== end.segment) throw new ConflictError('That video belongs to an earlier part of the recording.', { context: ctx });
-    await screens.appendPiece(o, recordingId, shareId, piece, true);
+    await screens.appendPiece(o, recordingId, shareId, piece, budget(), true);
     clog.debug('share piece taken after it ended', { ...ctx, lateMs: late });
     return answer();
   }
   const into = capture.mayCapture(capturing(row, state), 'screen', ctx);
   if (piece.segment !== state.notes.segment) throw new ConflictError('That video belongs to an earlier part of the recording.', { context: ctx });
-  await screens.appendPiece(o, into.recordingId, shareId, piece);
+  // Going: only while LiveKit lists a screen of theirs, so nobody puts video in the notes without sharing it in the call.
+  if (!row.room_name || !(await sharingNow(o, row.room_name, v.pass.identity))) throw new ForbiddenError(NOT_YOURS, { context: { ...ctx, why: 'not sharing' } });
+  await screens.appendPiece(o, into.recordingId, shareId, piece, budget());
   return answer();
 }
 
@@ -1638,7 +1665,7 @@ export async function shareEnded(v: Viewer, callId: string, shareId: string): Pr
     if (row.state !== 'live') throw new ConflictError('This call has ended.', { context: { callId } });
     const share = state.shares.find((x) => x.id === shareId);
     if (!share) throw notFound('That share', { callId });
-    if (share.identity !== v.pass.identity) throw new ForbiddenError('That isn’t a screen you’re sharing in this call.', { context: { callId } });
+    if (share.identity !== v.pass.identity) throw new ForbiddenError(NOT_YOURS, { context: { callId } });
     if (share.until !== null) return null;
     await save(o, c, callId, await sharesEnd(o, c, state, [{ share: shareId }], tenthsIn(row.started_at)));
     return { name: row.room_name };
