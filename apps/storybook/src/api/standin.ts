@@ -34,6 +34,7 @@ import * as spaces from './workspaces';
 /* ---------- how every answer comes back ---------- */
 
 const refused = (code: 'not-found' | 'forbidden' | 'conflict' | 'invalid', message: string) => new AlcoveApiError(code, message, { requestId: nextId('sb-req') });
+const noPayments = () => new AlcoveApiError('unavailable', 'Top-ups aren’t available right now.', { requestId: nextId('sb-req') });
 const offline = () => new AlcoveApiError('network', 'Can’t reach Alcove. Check your connection.');
 
 /** Answers after a moment, from the world as it is then, as a copy: what the app holds never changes under it. */
@@ -673,7 +674,15 @@ export const standIn: AlcoveApi = {
     restoreVersion: (id: ID) => answer(() => { spaces.treeOf(id); }),
     searchText: (id: ID) => spaces.searchText(id)
   },
-  credits: { balance: () => answer((w) => w.credits) },
+  // Storybook's Alcove takes no payments, as a server without a treasury: Plan and credits shows no way to add credits.
+  credits: {
+    balance: () => answer((w) => w.credits),
+    routes: () => answer(() => { throw noPayments(); }),
+    startTopUp: () => answer(() => { throw noPayments(); }),
+    topUp: () => answer(() => { throw noPayments(); }),
+    cancelTopUp: () => answer(() => { throw noPayments(); }),
+    topUps: () => answer(() => { throw noPayments(); })
+  },
   trust: { attestation: attest },
   diagnostics: { report: () => Promise.resolve() }
 };

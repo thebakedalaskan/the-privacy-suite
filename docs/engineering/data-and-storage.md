@@ -35,6 +35,7 @@ result, and [Changing what's stored](#changing-whats-stored) how it changes with
 | `personal_notes` | owner (the author), the note's organizer and item: one row for each person and note | `body_ciphertext` (everything they keep on it: what they wrote, bookmarks and what they point at, kept questions and answers, and which of it was added to the shared notes), sealed under the author's own keys. Replaced with each change, with no earlier versions |
 | `note_additions` | owner (the note's organizer), note item, addition ID, when it was added | `author_index` (keyed hash of who added it, so deleting their account finds their additions on anyone's notes), `body_ciphertext` (the words, who added it, and the lines or shared screens it points at), sealed under the organizer's keys |
 | `billing_accounts` | owner, `version` | `state_ciphertext` (balance and history, under `Kservice`) |
+| `deposits` | owner, deposit, provider (`oneclick`), state (`waiting`/`arriving`/`short`/`credited`/`held`/`failed`/`expired`/`cancelled`), created, when to check next (`check_after`), last checked, when to give up | `record_ciphertext` (a `deposit` record under `Kservice`'s accounting key, below) |
 | `workspaces` | owner, `workspace_id` (the public handle, Id128), `version`, when the oldest thing in its Trash went there (`trash_since`), created | `state_ciphertext` (its name and tree: [Workspaces](#workspaces)) |
 | `workspace_members` | owner (the workspace), `member_id` (what the API calls them), role (`admin`/`edit`/`read`), created | `email_index`, `person_ciphertext` (their address, their name if the workspace was made by them, and whether a call's invite put them there and nobody has changed their place by hand since: older records read as not) |
 | `documents` | owner (the workspace), `document_id`, `next_seq`, what it comes to in bytes, items and depth of nesting at its snapshot and since (`snapshot_bytes`, `bytes_since_snapshot`, `snapshot_items`, `items_since_snapshot`, `snapshot_nesting`, `nesting_since_snapshot`), how many of its items aren't on its page (`snapshot_retired_items`), `updates_since_snapshot`, how far the newest version reaches and when it was kept (`version_seq`, `version_at`), until when something's restoring it (`held_until`) or it stays closed because it wouldn't open (`closed_until`), created. One row for each document or board in the tree; a folder has none | — |
@@ -669,6 +670,16 @@ and this way it runs through the same auth, origin check and tests as everything
   ends a stream too, which is how one whose browser went as it opened is let go of. A browser that hears nothing for a
   minute takes the connection for dead.
 
+A credit top-up is a sealed `deposit` record, header `{ v: 1, kind: 'deposit', ownerId, depositId, keyVersion: '1' }`,
+under `Kservice`'s accounting key like the billing state, so the watcher opens it without anyone signed in: the
+route (chain, token, decimals, minimum), the deposit address and memo, the expiry, the amount asked and the quote's
+`minAmountIn` (token units), the credits promised and the rate they were priced at, the provider's whole signed quote,
+what the provider last said arrived while it was open (micro-USD), and once settled what was sent, what reached the treasury and what was refunded (micro-USD), the credits it added
+and the provider's reference, whether it was logged that the provider couldn't answer past its deadline
+(`unanswered`, default false), and why the provider's last finished answer wasn't credited (`doubt`, default null)
+([Payments and usage › How a top-up works](payments-and-usage.md#how-a-top-up-works)). No column holds anything
+readable.
+
 ## Writes, reads and deletes
 
 - **Audio pieces** are sealed with the recording's `Krec`, written to the object store, read back and checked
@@ -765,6 +776,10 @@ and this way it runs through the same auth, origin check and tests as everything
 - **Deleting** is physical, whether it's a note, a meeting or a whole account: rows, receipts and objects
   (see [Privacy › Deletion](privacy-keys-and-sessions.md#deletion)). A deleted account leaves no row keyed by
   its ID, except an `object_gc` entry until maintenance deletes an object the store refused.
+- **Top-ups** are inserted `waiting` when opened and change state only under a row lock, crediting the balance in
+  the same transaction; a final state never changes again. A `cancelled` one is still watched until its deadline, and
+  moves on if a payment reaches it; with nothing then, its next check is set to `infinity`, and back to now if a payment is found on it later. The watcher claims due ones with a one-minute lease
+  (`check_after`) and sets the next check by age.
 - **Credits used this month** are summed from the sealed billing history when the balance is read
   (`GET /v1/credits`): nothing about usage is stored in the clear ([Payments and usage](payments-and-usage.md)).
 
